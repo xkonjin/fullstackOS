@@ -1,0 +1,26 @@
+name: theorist-validate
+
+on:
+  pull_request:
+    paths:
+      - "docs/theorist/**"
+      - "scripts/theorist/**"
+      - "fleet/pipeline/stages.py"
+      - "skills/fleetmax/SKILL.md"
+      - "agents/claude-code/rules/theorist.md"
+  push:
+    branches: [main]
+    paths:
+      - "docs/theorist/**"
+      - "scripts/theorist/**"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate theorist notes
+        run: python3 scripts/theorist/validate.py --root docs/theorist

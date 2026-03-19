@@ -1,0 +1,73 @@
+# Codex CLI Configuration
+# Uses CLIProxyAPI as the model provider
+#
+# IMPORTANT: Authentication
+# Codex CLI does NOT use api_key from config.toml for HTTP auth.
+# It uses ~/.codex/auth.json for authentication:
+#   { "OPENAI_API_KEY": "your-proxy-key" }
+#
+# The key in auth.json must match one in CLIProxyAPI's api-keys list.
+# Run setup-mcp.sh to install config + auth + register MCP server.
+#
+# Available codex models (via CLIProxyAPI):
+#   gpt-5.4, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex,
+#   gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5-codex, gpt-5-codex-mini
+
+model_provider = "cliproxyapi"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+model_reasoning_summary = "auto"
+personality = "pragmatic"
+sandbox_mode = "workspace-write"
+approval_policy = "on-failure"
+web_search = "cached"
+
+[features]
+rmcp_client = true
+multi_agent = true
+
+[sandbox_workspace_write]
+writable_roots = ["$HOME/Dev"]  # Replace with your dev directory
+network_access = true
+
+[model_providers.cliproxyapi]
+name = "cliproxyapi"
+base_url = "http://127.0.0.1:8317/v1"
+wire_api = "responses"
+
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp@latest"]
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest"]
+
+[mcp_servers.gitnexus]
+command = "gitnexus"
+args = ["mcp"]
+
+[mcp_servers.exa]
+url = "https://mcp.exa.ai/mcp?exaApiKey=${EXA_API_KEY}&tools=web_search_exa,get_code_context_exa,company_research_exa"
+
+# Add trusted project directories
+[projects."$HOME"]  # Replace with your home directory
+trust_level = "trusted"
+
+[projects."$HOME/Dev"]  # Replace with your dev directory
+trust_level = "trusted"
+
+[agents.ui_expert]
+description = "Implementation-first design engineer for Figma, design systems, and polished frontend work"
+config_file = "$HOME/.codex/agents/ui-expert.toml"
+
+[agents.ui_reviewer]
+description = "UI critique and polish reviewer for accessibility, clarity, and visual quality"
+config_file = "$HOME/.codex/agents/ui-reviewer.toml"

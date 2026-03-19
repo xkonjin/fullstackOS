@@ -1,0 +1,371 @@
+version: 1
+
+defaults:
+  mode: deterministic
+  resource_pack_root: docs/resource-packs
+  fallback_fuzzy: true
+
+resource_packs:
+  ui-expert:
+    id: ui-expert
+    path: docs/resource-packs/ui-expert
+    summary: Curated design-engineering pack for UI implementation, review, motion, and craft.
+  product-design-router:
+    id: product-design-router
+    path: docs/best-practices
+    summary: Scoped best-practice subtree for product thinking, PM/spec planning, and planning-heavy design work.
+
+skill_packs:
+  orchestration_infra:
+    id: orchestration_infra
+    expert_role: infra_lead
+    preferred_role: infra_lead
+    preferred_cli: codex
+    preferred_model: gpt-5.4
+    verification_profile: pipeline-orchestrator
+    skills:
+      - fleetmax
+      - swarm
+      - tdd-agent
+  docs_theorist:
+    id: docs_theorist
+    expert_role: knowledge_lead
+    preferred_role: knowledge_lead
+    preferred_cli: claude
+    preferred_model: claude-opus-4-6
+    verification_profile: theorist-docs
+    skills:
+      - theorist
+      - progressive-disclosure
+      - product-thinking
+  ui_implement:
+    id: ui_implement
+    expert_role: ui_expert
+    preferred_role: design_lead
+    preferred_cli: codex
+    preferred_model: gpt-5.4
+    resource_pack_id: ui-expert
+    mcp_profile: ui-design
+    verification_profile: visual-ui
+    skills:
+      - figma
+      - ui-design-system
+      - frontend-craft
+      - product-thinking
+      - progressive-disclosure
+      - visual-qa
+  ui_review:
+    id: ui_review
+    expert_role: ui_reviewer
+    preferred_role: ui_reviewer
+    preferred_cli: claude
+    preferred_model: claude-opus-4-6
+    resource_pack_id: ui-expert
+    mcp_profile: ui-design
+    verification_profile: visual-ui-review
+    skills:
+      - design-review
+      - visual-qa
+      - product-thinking
+      - progressive-disclosure
+      - taste
+  ui_assets_motion:
+    id: ui_assets_motion
+    expert_role: motion_expert
+    preferred_role: design_lead
+    preferred_cli: gemini
+    preferred_model: gemini-3.1-pro-high
+    resource_pack_id: ui-expert
+    mcp_profile: browser-debug
+    verification_profile: motion-ui
+    skills:
+      - nano-banana
+      - animation-web
+      - animation-remotion
+      - css-effects
+      - design-trends
+  backend_implement:
+    id: backend_implement
+    expert_role: backend_lead
+    preferred_role: backend_lead
+    preferred_cli: codex
+    preferred_model: gpt-5.4
+    mcp_profile: backend-impl
+    verification_profile: targeted-tests
+    skills:
+      - tdd-agent
+      - sentry-setup
+      - verify-impl
+  security_audit:
+    id: security_audit
+    expert_role: security_lead
+    preferred_role: security_lead
+    preferred_cli: claude
+    preferred_model: claude-opus-4-6
+    mcp_profile: security-audit
+    verification_profile: security-scan
+    skills:
+      - security-auditor
+      - verify-impl
+  research_deep:
+    id: research_deep
+    expert_role: researcher
+    preferred_role: researcher
+    preferred_cli: claude
+    preferred_model: claude-opus-4-6
+    mcp_profile: full-research
+    verification_profile: targeted-tests
+    skills:
+      - x-research
+      - hn-search
+      - producthunt
+  test_strategy:
+    id: test_strategy
+    expert_role: qa_lead
+    preferred_role: qa_lead
+    preferred_cli: codex
+    preferred_model: gpt-5.2
+    mcp_profile: lean-default
+    verification_profile: targeted-tests
+    skills:
+      - tdd-agent
+      - verify-impl
+      - bug-hunter
+  product_design_router:
+    id: product_design_router
+    expert_role: design_lead
+    preferred_role: design_lead
+    preferred_cli: claude
+    preferred_model: claude-opus-4-6
+    resource_pack_id: product-design-router
+    verification_profile: product-design-router
+    skills:
+      - product_design_router
+      - product-thinking
+      - product-growth-engine
+      - spec-writer
+      - onboarding-audit
+      - growth-teardown
+      - ai-workflow-planner
+      - taste
+      - socratic
+      - ui-expert-router
+
+routes:
+  - id: orchestration_infra
+    priority: 94
+    task_family: orchestration_infra
+    skill_pack: orchestration_infra
+    route_reason: Matched orchestration, fleet, or workflow control-plane language.
+    match:
+      any_phrase:
+        - symphony
+        - orchestration
+        - routing
+        - workflow
+        - fleet
+        - control plane
+        - quality gate
+  - id: docs_theorist
+    priority: 93
+    task_family: docs_theorist
+    skill_pack: docs_theorist
+    route_reason: Matched documentation, theorist, or runbook language.
+    match:
+      any_phrase:
+        - theorist
+        - architecture note
+        - runbook
+        - docs
+        - documentation
+  - id: figma_link
+    priority: 100
+    task_family: ui_implement
+    skill_pack: ui_implement
+    route_reason: Matched Figma URL or explicit node-id pattern.
+    match:
+      any_regex:
+        - https?://(www\.)?figma\.com/(design|file|proto|board)/
+        - \bnode-id=\d+-\d+
+  - id: design_implement
+    priority: 95
+    task_family: ui_implement
+    skill_pack: ui_implement
+    route_reason: Matched design implementation language.
+    match:
+      any_phrase:
+        - implement this design
+        - build from figma
+        - match the figma
+        - implement this ui
+        - build this screen
+        - design system refactor
+        - component library
+        - design tokens
+  - id: design_review
+    priority: 90
+    task_family: ui_review
+    skill_pack: ui_review
+    route_reason: Matched design review or polish language.
+    match:
+      any_phrase:
+        - design review
+        - ui review
+        - ux review
+        - review this design
+        - review this ui
+        - audit this ui
+        - polish this ui
+        - refine this ui
+        - does this look right
+        - visual qa
+        - design qa
+  - id: product_design_router
+    priority: 92
+    task_family: product_design_router
+    skill_pack: product_design_router
+    route_reason: Matched product/design/planning language that needs structured product, taste, and reasoning guidance.
+    match:
+      any_phrase:
+        - product spec
+        - prd
+        - feature spec
+        - feature strategy
+        - product strategy
+        - write a prd
+        - write a spec
+        - user flow
+        - user journey
+        - onboarding flow
+        - onboarding experience
+        - information architecture
+        - navigation pattern
+        - settings navigation
+        - interaction design
+        - user experience
+        - ux flow
+        - product design
+        - feature design
+        - how should this work
+        - what should happen when
+        - should this live here
+        - product tradeoff
+        - design tradeoff
+        - should we build this
+        - evaluate this idea
+        - prioritize these features
+        - jobs to be done
+        - jtbd
+        - ia
+      any_regex:
+        - "\\b(prd|spec|roadmap|prioritiz(e|ation)|trade-?off|user journey|ia|information architecture|interaction design|feature design|product strategy|navigation|settings navigation|user experience|ux flow)\\b"
+  - id: security_audit
+    priority: 91
+    task_family: security_audit
+    skill_pack: security_audit
+    route_reason: Matched security, auth, or vulnerability language.
+    match:
+      any_phrase:
+        - security audit
+        - security review
+        - vulnerability
+        - owasp
+        - xss
+        - csrf
+        - sql injection
+        - secret scanning
+        - auth boundary
+        - access control
+        - encryption
+      any_regex:
+        - "\\b(owasp|xss|csrf|sql.?injection|auth(entication|orization)?\\s+(bug|vuln|issue|review)|secret.?scan|penetration)\\b"
+  - id: backend_implement
+    priority: 88
+    task_family: backend_implement
+    skill_pack: backend_implement
+    route_reason: Matched backend, database, API, or migration language.
+    match:
+      any_phrase:
+        - api endpoint
+        - database
+        - migration
+        - schema
+        - backend
+        - sql
+        - query optimization
+        - rest api
+        - graphql
+        - orm
+        - model
+      any_regex:
+        - "\\b(api\\s+endpoint|database|migration|schema\\s+(change|design)|query\\s+optim|backend\\s+(feature|service)|sql|graphql|orm|fastapi|express|django)\\b"
+  - id: test_strategy
+    priority: 87
+    task_family: test_strategy
+    skill_pack: test_strategy
+    route_reason: Matched test strategy or coverage planning language.
+    match:
+      any_phrase:
+        - test strategy
+        - test architecture
+        - coverage plan
+        - what to test
+        - test pyramid
+        - integration test
+        - e2e test
+        - test plan
+      any_regex:
+        - "\\b(test\\s+(strategy|architect|pyramid|plan)|coverage\\s+(plan|gap|target)|e2e\\s+test|integration\\s+test)\\b"
+  - id: research_deep
+    priority: 86
+    task_family: research_deep
+    skill_pack: research_deep
+    route_reason: Matched deep research or market analysis language.
+    match:
+      any_phrase:
+        - market analysis
+        - competitive analysis
+        - what are people saying
+        - industry research
+        - trend analysis
+        - deep research
+      any_regex:
+        - "\\b(market|competitive|industry|trend)\\s+(analysis|research)|what\\s+are\\s+people\\s+saying\\b"
+  - id: motion_assets
+    priority: 85
+    task_family: ui_assets_motion
+    skill_pack: ui_assets_motion
+    route_reason: Matched asset, animation, or illustration language.
+    match:
+      any_phrase:
+        - hero image
+        - hero illustration
+        - generate an asset
+        - create an icon
+        - animate this
+        - motion design
+        - microinteraction
+        - animation
+        - illustration
+        - sprite
+
+fallbacks:
+  by_role:
+    design_lead: ui_implement
+    ui_reviewer: ui_review
+    infra_lead: orchestration_infra
+    knowledge_lead: docs_theorist
+    backend_lead: backend_implement
+    security_lead: security_audit
+    qa_lead: test_strategy
+    researcher: research_deep
+  by_task_kind:
+    design_visual: ui_implement
+    design_system: ui_implement
+    product_ux: product_design_router
+    orchestration: orchestration_infra
+    docs: docs_theorist
+    backend: backend_implement
+    security: security_audit
+    research: research_deep
+    testing: test_strategy

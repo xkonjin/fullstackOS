@@ -1,0 +1,46 @@
+version: 1
+
+profiles:
+  targeted-tests:
+    description: Run targeted tests for the affected module
+    commands:
+      python: "pytest tests/ -x -q --tb=short"
+      typescript: "bun test"
+    pre_check: "ruff check --fix {files}"
+
+  pipeline-orchestrator:
+    description: Run full fleet pipeline test suite
+    commands:
+      python: "cd fleet && python3 -m pytest ../tests/ -x -q --tb=short"
+
+  visual-ui:
+    description: Run visual UI tests with Playwright
+    commands:
+      typescript: "npx playwright test --reporter=line"
+
+  visual-ui-review:
+    description: Visual QA review checks
+    commands:
+      typescript: "npx playwright test --reporter=line"
+
+  motion-ui:
+    description: Motion and animation verification
+    commands:
+      typescript: "npx playwright test --reporter=line"
+
+  theorist-docs:
+    description: Validate theorist note schema
+    commands:
+      python: "python3 scripts/theorist/validate.py --root docs/theorist"
+
+  product-design-router:
+    description: Verify product design artifacts
+    commands:
+      python: "pytest tests/ -x -q --tb=short -k product"
+
+  security-scan:
+    description: Security-focused linting and audit
+    commands:
+      python: "ruff check --select S {files}"
+      typescript: "npx eslint --rule 'no-eval: error' {files}"
+    pre_check: "ruff check --select S --fix {files}"

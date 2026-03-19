@@ -1,0 +1,35 @@
+name: readme-visual-planning-check
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "scripts/rollout-visual-planning.py"
+      - "install.sh"
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "scripts/rollout-visual-planning.py"
+      - "install.sh"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify README contains visual-planning workflow block
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          readme = Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          start = "<!-- VISUAL_PLANNING_WORKFLOW:START -->"
+          end = "<!-- VISUAL_PLANNING_WORKFLOW:END -->"
+          if start not in text or end not in text:
+              raise SystemExit("Missing visual planning workflow block in README.md")
+          print("README visual planning block present")
+          PY

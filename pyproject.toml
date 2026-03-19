@@ -1,0 +1,21 @@
+[tool.ruff]
+exclude = [".venv", ".tmp-opensandbox", ".artifacts", ".claude", ".worktrees"]
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+"coordinator/ai_coordinator.py" = ["E402"]
+"coordinator/emergency_failover.py" = ["E402"]
+"fleet/pipeline/circuit_breaker.py" = ["E402"]
+"fleet/pipeline/handoff.py" = ["E402"]
+"scripts/validate_plugins.py" = ["E402"]
+"tests/test_browser_health_auth.py" = ["E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Disable broken web3 pytest plugin from global site-packages
+addopts = "-p no:pytest_ethereum"
+markers = [
+    "slow: tests taking >1s (skip with -m 'not slow')",
+    "integration: live integration tests that hit real local services/dependencies",
+]

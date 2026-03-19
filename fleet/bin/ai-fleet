@@ -1,0 +1,2453 @@
+#!/bin/bash
+# ai-fleet - Unified local orchestration for Claude + Codex + optional Droid
+#
+# Goals:
+# - Multi-auth visibility/routing for CLIProxyAPI (ports 8317/8318)
+# - Unified stack/usage/load health checks + single endpoint gateway
+# - End-to-end smoke tests across gateway/Claude/Codex
+# - Agent-team orchestration runs with persisted artifacts
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# REPO_ROOT should point to the fullstackOS root (parent of fleet/).
+# When running from repo: SCRIPT_DIR=.../fullstackOS/fleet/bin → REPO_ROOT=.../fullstackOS
+# When installed via cp to ~/.local/bin: SCRIPT_DIR=~/.local/bin → need fallback
+_candidate="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd)"
+if [[ -d "$_candidate/fleet/pipeline" ]]; then
+  REPO_ROOT="$_candidate"
+else
+  # Installed outside repo tree — find the real fullstackOS root
+  REPO_ROOT=""
+  for _c in "$HOME/Dev/fullstackOS" "$HOME/dev/fullstackOS"; do
+    if [[ -d "$_c/fleet/pipeline" ]]; then
+      REPO_ROOT="$_c"
+      break
+    fi
+  done
+  if [[ -z "$REPO_ROOT" ]]; then
+    # Last resort: assume fleet dir is alongside script
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  fi
+fi
+unset _candidate _c
+
+COORDINATOR_INSTALL_HINT="${COORDINATOR_INSTALL_HINT:-$REPO_ROOT/coordinator/install.sh}"
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.ai-fleet}"
+RUNS_DIR="$FLEET_HOME/runs"
+mkdir -p "$RUNS_DIR"
+
+CLIPROXY_MANAGEMENT_KEY="${CLIPROXY_MANAGEMENT_KEY:-proxy-usage-2024}"
+PROXIES=(
+  "example-project|8317"
+)
+
+GATEWAY_URL="${AI_FLEET_GATEWAY_URL:-http://127.0.0.1:4105}"
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "missing required command: $cmd"
+    exit 1
+  fi
+}
+
+# Guard: ensure the Homebrew CLIProxyAPI service owns port 8317 (not a ghost dev build)
+ensure_cliproxy_service() {
+  local port="${1:-8317}"
+  local listener
+  listener=$(lsof -i :"$port" -P 2>/dev/null | grep LISTEN | head -1)
+  if [[ -z "$listener" ]]; then
+    echo "warn: nothing listening on port $port — starting CLIProxyAPI via brew"
+    brew services start cliproxyapi 2>/dev/null
+    sleep 3
+    return
+  fi
+  local pid
+  pid=$(echo "$listener" | awk '{print $2}')
+  local exe
+  exe=$(lsof -p "$pid" 2>/dev/null | grep ' txt ' | head -1 | awk '{print $NF}')
+  if [[ "$exe" != */homebrew/* ]]; then
+    echo "ERROR: port $port held by non-brew process (PID $pid): $exe"
+    echo "Kill it with: kill $pid"
+    echo "Then restart brew service: brew services restart cliproxyapi"
+    return 1
+  fi
+}
+
+resolve_ai_coordinator() {
+  if command -v ai-coordinator >/dev/null 2>&1; then
+    command -v ai-coordinator
+    return 0
+  fi
+
+  if [[ -x "$HOME/.local/bin/ai-coordinator" ]]; then
+    echo "$HOME/.local/bin/ai-coordinator"
+    return 0
+  fi
+
+  return 1
+}
+
+human_now() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+launch_claude_agent() {
+  local logfile="$1"
+  local prompt="$2"
+  local project_dir="${3:-.}"
+
+  # Use 'script' to capture Claude's TUI output
+  # -q = quiet (no start/done messages)
+  # Fallback to unbuffer if available, otherwise use script
+  if command -v unbuffer >/dev/null 2>&1; then
+    unbuffer claude -p "$prompt" --project-dir "$project_dir" > "$logfile" 2>&1 &
+  else
+    # macOS/Linux: script -q logfile command args...
+    script -q "$logfile" claude -p "$prompt" --project-dir "$project_dir" &
+  fi
+  echo $!
+}
+
+gateway_api_key() {
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path.home() / ".ai-fleet" / "gateway.json"
+if not p.exists():
+    raise SystemExit(0)
+
+try:
+    cfg = json.loads(p.read_text())
+except Exception:
+    raise SystemExit(0)
+
+keys = ((cfg.get("server") or {}).get("api_keys") or [])
+if keys:
+    print(keys[0])
+PY
+}
+
+print_gateway_route() {
+  local key route_json
+  key="$(gateway_api_key)"
+  if [[ -z "$key" ]]; then
+    echo "gateway_route=missing_key (run ai-fleet-gateway once to generate config)"
+    return 0
+  fi
+
+  route_json="$(curl -sS -m 6 -H "Authorization: Bearer ${key}" "${GATEWAY_URL}/v1/route" 2>/dev/null || true)"
+  if [[ -z "$route_json" ]]; then
+    echo "gateway_route=unavailable"
+    return 0
+  fi
+
+  python3 - "$route_json" <<'PY'
+import json, sys
+raw = (sys.argv[1] or "").strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    print("gateway_route=invalid_json")
+    raise SystemExit(0)
+
+print(f"gateway_codex_profile={obj.get('codex_profile','')}")
+print(f"gateway_gemini_profile={obj.get('gemini_profile','')}")
+print(f"gateway_claude_source={obj.get('claude_source','')}")
+PY
+}
+
+print_gateway_health_summary() {
+  local health_json
+  health_json="$(curl -sS -m 8 "${GATEWAY_URL}/v1/health" 2>/dev/null || true)"
+  if [[ -z "$health_json" ]]; then
+    echo "gateway_health=unavailable"
+    return 0
+  fi
+
+  python3 - "$health_json" <<'PY'
+import json, sys
+
+raw = (sys.argv[1] or "").strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    print("gateway_health=invalid_json")
+    raise SystemExit(0)
+
+claude = obj.get("claude") or {}
+usage = claude.get("usage") or {}
+print(f"gateway_litellm_ok={claude.get('litellm_ok', False)}")
+print(f"gateway_claude_recommended_source={usage.get('recommended_source','')}")
+
+for p in (obj.get("codex") or {}).get("profiles", []):
+    print(
+        "codex_profile="
+        f"{p.get('name','')} "
+        f"healthy={p.get('healthy', False)} "
+        f"failures={p.get('failures', 0)} "
+        f"requests={p.get('requests', 0)} "
+        f"successes={p.get('successes', 0)} "
+        f"auth_exists={p.get('auth_exists', False)}"
+    )
+
+for p in (obj.get("gemini") or {}).get("profiles", []):
+    print(
+        "gemini_profile="
+        f"{p.get('name','')} "
+        f"healthy={p.get('healthy', False)} "
+        f"failures={p.get('failures', 0)} "
+        f"requests={p.get('requests', 0)} "
+        f"successes={p.get('successes', 0)} "
+        f"home_exists={p.get('home_exists', False)}"
+    )
+
+for p in obj.get("external_providers", []):
+    print(
+        "provider="
+        f"{p.get('name','')} "
+        f"enabled={p.get('enabled', False)} "
+        f"key_present={p.get('key_present', False)} "
+        f"healthy={p.get('healthy', False)} "
+        f"failures={p.get('failures', 0)} "
+        f"requests={p.get('requests', 0)} "
+        f"successes={p.get('successes', 0)}"
+    )
+PY
+}
+
+fetch_proxy_usage() {
+  local port="$1"
+  curl -sS -m 4 \
+    -H "X-Management-Key: ${CLIPROXY_MANAGEMENT_KEY}" \
+    "http://127.0.0.1:${port}/v0/management/usage" 2>/dev/null
+}
+
+proxy_row_from_json() {
+  local name="$1"
+  local port="$2"
+  local body="$3"
+
+  python3 - "$name" "$port" "$body" <<'PY'
+import datetime
+import json
+import sys
+
+name = sys.argv[1]
+port = sys.argv[2]
+raw = (sys.argv[3] or "").strip()
+
+if not raw:
+    print(f"{name}|{port}|down|0|0|0|0|0|0.0")
+    raise SystemExit(0)
+
+try:
+    obj = json.loads(raw)
+except Exception:
+    print(f"{name}|{port}|down|0|0|0|0|0|0.0")
+    raise SystemExit(0)
+
+usage = obj.get("usage") or {}
+
+try:
+    total = int(usage.get("total_requests") or 0)
+except Exception:
+    total = 0
+
+try:
+    success = int(usage.get("success_count") or 0)
+except Exception:
+    success = 0
+
+try:
+    failures = int(usage.get("failure_count") or obj.get("failed_requests") or 0)
+except Exception:
+    failures = 0
+
+try:
+    tokens = int(usage.get("total_tokens") or 0)
+except Exception:
+    tokens = 0
+
+hour_key = str(datetime.datetime.now().hour)
+tokens_by_hour = usage.get("tokens_by_hour") or {}
+try:
+    hour_tokens = int(tokens_by_hour.get(hour_key) or 0)
+except Exception:
+    hour_tokens = 0
+
+if total > 0:
+    success_rate = (success / total) * 100.0
+else:
+    success_rate = 100.0
+
+status = "healthy"
+if total > 0 and success == 0 and failures > 0:
+    status = "degraded"
+elif success_rate < 80.0:
+    status = "degraded"
+
+print(f"{name}|{port}|{status}|{total}|{success}|{failures}|{tokens}|{hour_tokens}|{success_rate:.1f}")
+PY
+}
+
+collect_proxy_rows() {
+  local rows=()
+  local item name port body row
+
+  for item in "${PROXIES[@]}"; do
+    IFS='|' read -r name port <<<"$item"
+    if body=$(fetch_proxy_usage "$port"); then
+      row=$(proxy_row_from_json "$name" "$port" "$body")
+    else
+      row="${name}|${port}|down|0|0|0|0|0|0.0"
+    fi
+    rows+=("$row")
+  done
+
+  printf '%s\n' "${rows[@]}"
+}
+
+print_proxy_table() {
+  local rows
+  rows=$(collect_proxy_rows)
+
+  printf '%-12s %-5s %-9s %9s %9s %9s %12s %12s %9s\n' \
+    'auth' 'port' 'status' 'requests' 'success' 'failures' 'tokens' 'hour_tokens' 'ok_rate'
+  printf '%-12s %-5s %-9s %9s %9s %9s %12s %12s %9s\n' \
+    '----' '----' '------' '--------' '-------' '--------' '------' '-----------' '-------'
+
+  while IFS='|' read -r name port status total success failures tokens hour_tokens ok_rate; do
+    printf '%-12s %-5s %-9s %9s %9s %9s %12s %12s %8s%%\n' \
+      "$name" "$port" "$status" "$total" "$success" "$failures" "$tokens" "$hour_tokens" "$ok_rate"
+  done <<<"$rows"
+}
+
+recommended_auth() {
+  local rows best_name="" best_port="" best_score=999999999999999
+  rows=$(collect_proxy_rows)
+
+  while IFS='|' read -r name port status total success failures tokens hour_tokens ok_rate; do
+    local penalty=0
+    if [[ "$status" == "down" ]]; then
+      penalty=1000000000000
+    elif [[ "$status" == "degraded" ]]; then
+      penalty=1000000000
+    fi
+
+    local score=$((penalty + failures * 1000000 + hour_tokens * 10 + tokens / 100))
+    if (( score < best_score )); then
+      best_score=$score
+      best_name=$name
+      best_port=$port
+    fi
+  done <<<"$rows"
+
+  echo "${best_name}|${best_port}|${best_score}"
+}
+
+cmd_route() {
+  local rec rec_name rec_port rec_score
+  rec=$(recommended_auth)
+  IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+
+  echo "recommended_auth=${rec_name}"
+  echo "recommended_port=${rec_port}"
+  print_gateway_route
+}
+
+cmd_droid() {
+  local mode="$1"
+  shift || true
+  local prompt="${*:-}"
+  if [[ -z "$prompt" ]]; then
+    echo "Usage: ai-fleet droid-${mode} \"<prompt>\""
+    exit 1
+  fi
+
+  local rec rec_name rec_port rec_score
+  rec=$(recommended_auth)
+  IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+
+  echo "dispatch=droid mode=${mode} auth=${rec_name} port=${rec_port}"
+
+  # Prefer coordinator path when available to get preflight + reliability fallback.
+  local coordinator_bin
+  if coordinator_bin="$(resolve_ai_coordinator 2>/dev/null)"; then
+    if [[ "$mode" == "swarm" ]]; then
+      "$coordinator_bin" swarm --repo "$(pwd)" --objective "$prompt" --approve
+    else
+      "$coordinator_bin" exec --repo "$(pwd)" --objective "$prompt" --via droid --timeout "${AI_FLEET_DROID_TIMEOUT:-180}"
+    fi
+    return $?
+  fi
+
+  local out
+  out=$(droid exec "$prompt" 2>&1 || true)
+
+  # LiteLLM can temporarily throttle. Apply pragmatic fallback routing.
+  if echo "$out" | grep -Eq 'RateLimitError|throttling_error|No deployments available|cooling down'; then
+    local fallback_model="claude-opus-4-5-20251101"
+
+    echo "$out"
+    echo "[WARN] primary model throttled; retrying with fallback model=${fallback_model}"
+    droid exec --model "$fallback_model" "$prompt"
+    return 0
+  fi
+
+  echo "$out"
+}
+
+cmd_status() {
+  echo "[${USER}] AI Fleet Status @ $(human_now)"
+  echo
+
+  curl -sf -m 6 "${GATEWAY_URL}/v1/health" | python3 -m json.tool 2>/dev/null || echo "gateway not responding"
+
+  echo
+  echo "CLIProxy Auth Load"
+  print_proxy_table
+
+  local rec
+  rec=$(recommended_auth)
+  IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+  echo
+  echo "recommended_auth=${rec_name} (port ${rec_port})"
+
+  echo
+  echo "Gateway Route"
+  print_gateway_route
+
+  echo
+  echo "Gateway Backend Health"
+  print_gateway_health_summary
+
+  echo
+  echo "Tool Versions"
+  droid --version 2>/dev/null || echo "droid: missing"
+  claude --version 2>/dev/null || echo "claude: missing"
+  codex --version 2>/dev/null || echo "codex: missing"
+}
+
+cmd_usage() {
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  if (( json_mode == 1 )); then
+    local health_json rows rec rec_name rec_port rec_score
+    health_json="$(curl -sS -m 6 "${GATEWAY_URL}/v1/health" 2>/dev/null || true)"
+    rows="$(collect_proxy_rows)"
+    rec=$(recommended_auth)
+    IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+
+    python3 - "$health_json" "$rows" "$rec_name" "$rec_port" "$GATEWAY_URL" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+raw_health = (sys.argv[1] or "").strip()
+raw_rows = sys.argv[2] or ""
+rec_name = sys.argv[3]
+rec_port = sys.argv[4]
+gateway_url = sys.argv[5]
+
+health = None
+gateway_reachable = False
+if raw_health:
+    try:
+        health = json.loads(raw_health)
+        gateway_reachable = True
+    except Exception:
+        health = None
+
+proxies = []
+for line in raw_rows.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    parts = line.split("|")
+    if len(parts) != 9:
+        continue
+    name, port, status, total, success, failures, tokens, hour_tokens, ok_rate = parts
+    def to_int(v):
+        try:
+            return int(v)
+        except Exception:
+            return 0
+    def to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+    proxies.append({
+        "auth": name,
+        "port": port,
+        "status": status,
+        "requests": to_int(total),
+        "success": to_int(success),
+        "failures": to_int(failures),
+        "tokens": to_int(tokens),
+        "hour_tokens": to_int(hour_tokens),
+        "ok_rate": to_float(ok_rate),
+    })
+
+output = {
+    "usage_result": "OK",
+    "gateway_url": gateway_url,
+    "gateway_reachable": gateway_reachable,
+    "gateway_health": health,
+    "proxies": proxies,
+    "recommended_auth": rec_name,
+    "recommended_port": rec_port,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+}
+print(json.dumps(output, indent=2))
+PY
+    return 0
+  fi
+
+  curl -sf -m 6 "${GATEWAY_URL}/v1/health" | python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'  {k}: {v}') for k,v in d.items()]" 2>/dev/null || echo "gateway not responding"
+
+  echo
+  echo "CLIProxy Auth Load"
+  print_proxy_table
+
+  local rec
+  rec=$(recommended_auth)
+  IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+  echo "recommended_auth=${rec_name} (port ${rec_port})"
+
+  echo
+  echo "Gateway Backend Health"
+  print_gateway_health_summary
+}
+
+cmd_load() {
+  echo "CLIProxy Auth Load @ $(human_now)"
+  print_proxy_table
+
+  local rec
+  rec=$(recommended_auth)
+  IFS='|' read -r rec_name rec_port rec_score <<<"$rec"
+  echo
+  echo "recommended_auth=${rec_name} (port ${rec_port})"
+}
+
+cmd_watch() {
+  local interval="${1:-15}"
+  if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+    echo "interval must be an integer number of seconds"
+    exit 1
+  fi
+
+  while true; do
+    clear
+    cmd_status
+    sleep "$interval"
+  done
+}
+
+run_check() {
+  local name="$1"
+  local cmd="$2"
+  local pattern="$3"
+  local timeout_s="${4:-90}"
+
+  local out
+  out=$(python3 - "$cmd" "$timeout_s" <<'PY'
+import shlex
+import subprocess
+import sys
+
+
+def _ensure_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+cmd = sys.argv[1]
+timeout_s = int(sys.argv[2])
+
+try:
+    cmd_parts = shlex.split(cmd)
+except ValueError as e:
+    print(f"__PARSE_ERROR__ {e}")
+    raise SystemExit(0)
+
+try:
+    p = subprocess.run(
+        cmd_parts,
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    print((p.stdout or "") + (p.stderr or ""))
+except FileNotFoundError as e:
+    print(str(e))
+except subprocess.TimeoutExpired as e:
+    out = _ensure_text(e.stdout) + _ensure_text(e.stderr)
+    print(out + f"\n__TIMEOUT__ after {timeout_s}s")
+PY
+)
+
+  if echo "$out" | grep -Eq "$pattern"; then
+    printf '[PASS] %s\n' "$name"
+    return 0
+  fi
+
+  printf '[FAIL] %s\n' "$name"
+  case "$name" in
+    gateway_health|gateway_models)
+      printf "  Fix: Ensure gateway is running: ai-fleet start\n" ;;
+    gateway_chat_*|gateway_responses|gateway_stream_*)
+      printf "  Fix: Check gateway logs: tmux a -t ai-fleet\n" ;;
+    codex_exec)
+      printf "  Fix: Run 'codex auth login' or check codex profiles\n" ;;
+    proxy_models*)
+      printf "  Fix: Ensure CLIProxyAPI running on port 8317\n" ;;
+    claude_print)
+      printf "  Fix: Run outside Claude Code session, or set CLAUDE_CODE_ENTRYPOINT\n" ;;
+    stack_health)
+      printf "  Fix: Start all services: ai-fleet start\n" ;;
+    gateway_openrouter_direct)
+      printf "  Fix: Verify OPENROUTER_API_KEY is set and valid\n" ;;
+    gateway_kimi_direct)
+      printf "  Fix: Verify KIMI_API_KEY is set and valid\n" ;;
+    gateway_minimax_direct)
+      printf "  Fix: Verify MINIMAX_API_KEY is set and valid\n" ;;
+    droid_*)
+      printf "  Fix: Check droid auth or provider availability\n" ;;
+    *)
+      printf "  Fix: Check logs and ensure all services are running\n" ;;
+  esac
+  echo "---- output (${name}) ----"
+  echo "$out" | sed -n '1,120p'
+  echo "--------------------------"
+  return 1
+}
+
+run_check_warn() {
+  local name="$1"
+  local cmd="$2"
+  local pattern="$3"
+  local timeout_s="${4:-90}"
+
+  local out
+  out=$(python3 - "$cmd" "$timeout_s" <<'PY'
+import shlex
+import subprocess
+import sys
+
+
+def _ensure_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+cmd = sys.argv[1]
+timeout_s = int(sys.argv[2])
+
+try:
+    cmd_parts = shlex.split(cmd)
+except ValueError as e:
+    print(f"__PARSE_ERROR__ {e}")
+    raise SystemExit(0)
+
+try:
+    p = subprocess.run(
+        cmd_parts,
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    print((p.stdout or "") + (p.stderr or ""))
+except FileNotFoundError as e:
+    print(str(e))
+except subprocess.TimeoutExpired as e:
+    out = _ensure_text(e.stdout) + _ensure_text(e.stderr)
+    print(out + f"\n__TIMEOUT__ after {timeout_s}s")
+PY
+)
+
+  if echo "$out" | grep -Eq "$pattern"; then
+    printf '[PASS] %s\n' "$name"
+    return 0
+  fi
+
+  printf '[WARN] %s\n' "$name"
+  echo "---- output (${name}) ----"
+  echo "$out" | sed -n '1,120p'
+  echo "--------------------------"
+  return 0
+}
+
+cmd_smoke() {
+  local failures=0
+  local gw_key
+  local gateway_models_json=""
+  gw_key="$(gateway_api_key)"
+
+  run_check "stack_health" "curl -sS -m 6 ${GATEWAY_URL}/v1/health" '"status"' 15 || failures=$((failures + 1))
+  run_check "proxy_models_8317" "curl -sS -m 4 -H 'Authorization: Bearer sk-proxy' http://127.0.0.1:8317/v1/models" '"data"' 15 || failures=$((failures + 1))
+  if curl -sf -m 2 http://127.0.0.1:8318/v1/health >/dev/null 2>&1; then
+    run_check "proxy_models_8318" "curl -sS -m 4 -H 'Authorization: Bearer sk-proxy' http://127.0.0.1:8318/v1/models" '"data"' 15 || failures=$((failures + 1))
+  else
+    echo "[SKIP] proxy_models_8318 (port 8318 not running)"
+  fi
+  run_check "gateway_health" "curl -sS -m 6 ${GATEWAY_URL}/v1/health" '"status"' 20 || failures=$((failures + 1))
+
+  if [[ -z "$gw_key" ]]; then
+    echo "[FAIL] gateway_models (missing API key in ~/.ai-fleet/gateway.json)"
+    failures=$((failures + 1))
+  else
+    gateway_models_json="$(curl -sS -m 6 -H "Authorization: Bearer ${gw_key}" ${GATEWAY_URL}/v1/models || true)"
+    if echo "$gateway_models_json" | grep -q '"data"'; then
+      echo "[PASS] gateway_models"
+    else
+      echo "[FAIL] gateway_models"
+      echo "---- output (gateway_models) ----"
+      echo "$gateway_models_json" | sed -n '1,120p'
+      echo "--------------------------"
+      failures=$((failures + 1))
+    fi
+    local gateway_has_kimi=0
+    local gateway_has_minimax=0
+    if echo "$gateway_models_json" | grep -Eq '"id"\s*:\s*"(smart-kimi|kimi/kimi-k2\.5|or-kimi-k2\.5|or-kimi-k2|kimi-k2\.5|kimi-k2)"'; then
+      gateway_has_kimi=1
+    fi
+    if echo "$gateway_models_json" | grep -Eq '"id"\s*:\s*"(smart-minimax|minimax/minimax-m1|or-minimax-m1|minimax-m1)"'; then
+      gateway_has_minimax=1
+    fi
+    if [[ "${ENABLE_DIRECT_PROVIDER_SMOKE:-0}" == "1" && -n "${KIMI_API_KEY:-}" && "$gateway_has_kimi" -eq 1 ]]; then
+      run_check_warn "gateway_kimi_direct" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"kimi/kimi-k2.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130
+    else
+      echo "[INFO] kimi direct check skipped (set ENABLE_DIRECT_PROVIDER_SMOKE=1 to enable)"
+    fi
+    if [[ "${ENABLE_DIRECT_PROVIDER_SMOKE:-0}" == "1" && -n "${MINIMAX_API_KEY:-}" && "$gateway_has_minimax" -eq 1 ]]; then
+      run_check_warn "gateway_minimax_direct" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"minimax/minimax-m1\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130
+    else
+      echo "[INFO] minimax direct check skipped (set ENABLE_DIRECT_PROVIDER_SMOKE=1 to enable)"
+    fi
+    run_check "gateway_chat_sonnet" "curl -sS -m 90 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-sonnet\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 100 || failures=$((failures + 1))
+    run_check "gateway_chat_simple" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-simple\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130 || failures=$((failures + 1))
+    run_check "gateway_chat_coding" "curl -sS -m 150 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-coding\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 160 || failures=$((failures + 1))
+    run_check "gateway_chat_premium" "curl -sS -m 180 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-premium\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 190 || failures=$((failures + 1))
+    run_check "gateway_chat_haiku" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-haiku\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130 || failures=$((failures + 1))
+    run_check "gateway_chat_codex_mini" "curl -sS -m 150 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-codex-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 160 || failures=$((failures + 1))
+    run_check "gateway_chat_codex_53" "curl -sS -m 220 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-codex-5.3\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 230 || failures=$((failures + 1))
+    run_check "gateway_chat_opus_46" "curl -sS -m 220 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-opus-4.6\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 230 || failures=$((failures + 1))
+    run_check "gateway_chat_kimi_alias" "curl -sS -m 180 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-kimi\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 190 || failures=$((failures + 1))
+    run_check "gateway_chat_minimax_alias" "curl -sS -m 180 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-minimax\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 190 || failures=$((failures + 1))
+    run_check "gateway_chat_gemini" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-gemini\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130 || failures=$((failures + 1))
+    run_check "gateway_responses" "curl -sS -m 90 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/responses -d '{\"model\":\"smart-sonnet\",\"input\":\"Reply exactly OK.\"}'" 'output_text|OK|ok' 100 || failures=$((failures + 1))
+    run_check "gateway_stream_http11" "curl -sS -i -N -m 70 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-haiku\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}' | sed -n '1,20p'" 'HTTP/1.1 200 OK' 80 || failures=$((failures + 1))
+    run_check "gateway_stream_done" "curl -sS -i -N -m 70 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-haiku\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}' | sed -n '1,80p'" 'data: \[DONE\]' 80 || failures=$((failures + 1))
+    run_check "gateway_chat_codex" "curl -sS -m 210 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"smart-codex\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 220 || failures=$((failures + 1))
+
+    if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+      run_check_warn "gateway_openrouter_direct" "curl -sS -m 120 -H 'Authorization: Bearer ${gw_key}' -H 'Content-Type: application/json' ${GATEWAY_URL}/v1/chat/completions -d '{\"model\":\"openrouter/openai/gpt-5.3-codex\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply exactly OK.\"}]}'" 'OK|ok|choices' 130
+    else
+      echo "[INFO] openrouter direct check skipped (OPENROUTER_API_KEY not set)"
+    fi
+
+  fi
+
+  # Claude CLI refuses nested sessions (CLAUDECODE env var set by parent)
+  if [[ -z "${CLAUDECODE:-}" ]]; then
+    run_check "claude_print" "claude --print \"Reply exactly OK.\"" "OK" 75 || failures=$((failures + 1))
+  else
+    echo "[SKIP] claude_print (inside Claude Code session)"
+  fi
+  run_check "codex_exec" "codex exec --full-auto --skip-git-repo-check --ephemeral \"Reply exactly OK.\"" "OK" 90 || failures=$((failures + 1))
+
+  if [[ "${ENABLE_DROID_TESTS:-0}" == "1" ]] && command -v droid >/dev/null 2>&1; then
+    # Droid checks are advisory because provider cooldown windows are temporal.
+    run_check_warn "droid_default" "droid exec \"Reply exactly OK.\"" "OK" 90
+    run_check_warn "droid_nexus_direct" "droid exec --model custom:nexus-direct \"Reply exactly OK.\"" "OK" 90
+    run_check_warn "droid_nexus_swarm" "droid exec --model custom:nexus-swarm \"Reply exactly OK.\"" "OK" 90
+  else
+    echo "[INFO] droid checks skipped (set ENABLE_DROID_TESTS=1 to enable)"
+  fi
+
+  # Informational check: orchestrator (8318) if running
+  if curl -sf -m 2 http://127.0.0.1:8318/v1/health >/dev/null 2>&1; then
+    local lotus_check
+    lotus_check=$(curl -sS -m 8 -H 'Authorization: Bearer sk-dummy' -H 'Content-Type: application/json' \
+      http://127.0.0.1:8318/v1/chat/completions \
+      -d '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Reply exactly OK."}]}' || true)
+    if echo "$lotus_check" | grep -Eq 'rate_limit_error'; then
+      echo "[WARN] primary_auth is currently rate-limited; routing logic will prefer example-project"
+    fi
+  fi
+
+  if (( failures > 0 )); then
+    echo "smoke_result=FAILED failures=${failures}"
+    return 1
+  fi
+
+  echo "smoke_result=PASSED"
+}
+
+cmd_team() {
+  local objective="${*:-}"
+  if [[ -z "$objective" ]]; then
+    echo "Usage: ai-fleet team \"<objective>\""
+    exit 1
+  fi
+
+  local ORCH_URL="http://127.0.0.1:8318"
+  local ORCH_KEY="sk-proxy"
+
+  # Preflight: orchestrator must be running
+  if ! curl -sf -m 3 "${ORCH_URL}/health" >/dev/null 2>&1; then
+    echo "[FAIL] Orchestrator not running on :8318"
+    echo "Start with: cd ~/Dev/fullstackOS/services/orchestrator && bun run src/index.ts"
+    exit 1
+  fi
+
+  local cwd
+  cwd="$(pwd)"
+  local run_id run_dir
+  run_id="$(date +%Y%m%d_%H%M%S)"
+  run_dir="$RUNS_DIR/$run_id"
+  mkdir -p "$run_dir"
+
+  printf '%s\n' "$objective" > "$run_dir/00_objective.txt"
+
+  # --- Phase 1: Dispatch codex planner + kimi analyst via fleet dispatch ---
+  echo "[team] Dispatching codex planner + kimi analyst via orchestrator fleet..."
+
+  local codex_prompt kimi_prompt
+  codex_prompt="You are codex-planner. Objective: ${objective}. Produce a concise execution plan with owners (codex, claude, kimi), dependencies, and risk checks. Use numbered steps. Working directory: ${cwd}"
+  kimi_prompt="You are kimi-analyst. Objective: ${objective}. Analyze the codebase, identify risks, edge cases, and suggest architectural improvements. Working directory: ${cwd}"
+
+  # Dispatch both via orchestrator fleet API (runs in tmux with own auth)
+  local codex_resp kimi_resp codex_id kimi_id
+  codex_resp=$(curl -s -X POST "${ORCH_URL}/v1/fleet/dispatch" \
+    -H "Authorization: Bearer ${ORCH_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"cli\":\"codex\",\"prompt\":$(printf '%s' "$codex_prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"cwd\":\"${cwd}\",\"one_shot\":true,\"codex_preferred\":true,\"metadata\":{\"agent_type\":\"fleet\",\"task_kind\":\"planning\",\"codex_preferred\":true}}")
+  codex_id=$(echo "$codex_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+
+  kimi_resp=$(curl -s -X POST "${ORCH_URL}/v1/fleet/dispatch" \
+    -H "Authorization: Bearer ${ORCH_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"cli\":\"kimi\",\"prompt\":$(printf '%s' "$kimi_prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"cwd\":\"${cwd}\"}")
+  kimi_id=$(echo "$kimi_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+
+  if [[ -z "$codex_id" ]]; then
+    echo "[FAIL] Codex dispatch failed: $codex_resp"
+    exit 1
+  fi
+  echo "[team] Codex planner: job=$codex_id (tmux: fleet-${codex_id})"
+
+  if [[ -z "$kimi_id" ]]; then
+    echo "[WARN] Kimi dispatch failed (continuing without): $kimi_resp"
+  else
+    echo "[team] Kimi analyst:  job=$kimi_id (tmux: fleet-${kimi_id})"
+  fi
+
+  # --- Phase 2: Poll for completion ---
+  echo "[team] Waiting for agents to complete..."
+  local max_wait=300  # 5 minutes
+  local elapsed=0
+  local codex_done=0 kimi_done=0
+
+  while (( elapsed < max_wait )); do
+    sleep 10
+    elapsed=$((elapsed + 10))
+
+    if (( codex_done == 0 )); then
+      local codex_status
+      codex_status=$(curl -s "${ORCH_URL}/v1/fleet/jobs/${codex_id}" \
+        -H "Authorization: Bearer ${ORCH_KEY}" | \
+        python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null)
+      if [[ "$codex_status" != "running" ]]; then
+        codex_done=1
+        echo "[team] Codex completed (${elapsed}s, status=${codex_status})"
+      fi
+    fi
+
+    if [[ -n "$kimi_id" ]] && (( kimi_done == 0 )); then
+      local kimi_status
+      kimi_status=$(curl -s "${ORCH_URL}/v1/fleet/jobs/${kimi_id}" \
+        -H "Authorization: Bearer ${ORCH_KEY}" | \
+        python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null)
+      if [[ "$kimi_status" != "running" ]]; then
+        kimi_done=1
+        echo "[team] Kimi completed (${elapsed}s, status=${kimi_status})"
+      fi
+    fi
+
+    if (( codex_done == 1 )) && { [[ -z "$kimi_id" ]] || (( kimi_done == 1 )); }; then
+      break
+    fi
+
+    printf "[team] Waiting... (%ds/%ds)\n" "$elapsed" "$max_wait"
+  done
+
+  # --- Phase 3: Capture outputs ---
+  curl -s "${ORCH_URL}/v1/fleet/jobs/${codex_id}/output?lines=500" \
+    -H "Authorization: Bearer ${ORCH_KEY}" | \
+    python3 -c "import json,sys; print(json.load(sys.stdin).get('output','(no output)'))" \
+    > "$run_dir/01_codex_plan.txt" 2>/dev/null
+
+  if [[ -n "$kimi_id" ]]; then
+    curl -s "${ORCH_URL}/v1/fleet/jobs/${kimi_id}/output?lines=500" \
+      -H "Authorization: Bearer ${ORCH_KEY}" | \
+      python3 -c "import json,sys; print(json.load(sys.stdin).get('output','(no output)'))" \
+      > "$run_dir/02_kimi_analysis.txt" 2>/dev/null
+  else
+    echo "(kimi dispatch skipped)" > "$run_dir/02_kimi_analysis.txt"
+  fi
+
+  # --- Phase 4: Synthesis via orchestrator API (routes through claude/antigravity) ---
+  echo "[team] Synthesizing runbook via orchestrator..."
+  local synthesis_prompt
+  synthesis_prompt="Objective: ${objective}
+
+You are fleet-orchestrator. Synthesize the outputs below into one final execution runbook with:
+1) final owner-by-owner task list,
+2) command sequence,
+3) verification checklist,
+4) rollback/fallback plan.
+
+--- Codex Plan ---
+$(sed -n '1,240p' "$run_dir/01_codex_plan.txt" 2>/dev/null)
+
+--- Kimi Analysis ---
+$(sed -n '1,240p' "$run_dir/02_kimi_analysis.txt" 2>/dev/null)
+"
+
+  curl -s -X POST "${ORCH_URL}/v1/messages" \
+    -H "Authorization: Bearer ${ORCH_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":4096,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":$(printf '%s' "$synthesis_prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}]}" | \
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if 'content' in d:
+    for block in d['content']:
+        if block.get('type') == 'text':
+            print(block['text'])
+elif 'error' in d:
+    print(f'ERROR: {d[\"error\"]}')
+" > "$run_dir/03_runbook.txt" 2>/dev/null
+
+  # --- Manifest ---
+  cat > "$run_dir/manifest.txt" <<MANIFEST
+run_id=$run_id
+created_at=$(human_now)
+objective=$objective
+codex_job=$codex_id
+kimi_job=${kimi_id:-skipped}
+cwd=$cwd
+files:
+  - 00_objective.txt
+  - 01_codex_plan.txt
+  - 02_kimi_analysis.txt
+  - 03_runbook.txt
+MANIFEST
+
+  echo
+  echo "team_run_dir=$run_dir"
+  echo "codex_job=$codex_id kimi_job=${kimi_id:-skipped}"
+  echo
+  echo "--- Final Runbook ---"
+  cat "$run_dir/03_runbook.txt" 2>/dev/null || echo "(no runbook generated)"
+}
+
+cmd_prune() {
+  local days="${1:-14}"
+  if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+    echo "Usage: ai-fleet prune [days]"
+    exit 1
+  fi
+
+  local targets=(
+    "$HOME/.factory"
+    "$HOME/.claude"
+    "$HOME/Library/LaunchAgents"
+  )
+
+  local found=()
+  local t
+  for t in "${targets[@]}"; do
+    if [[ -d "$t" ]]; then
+      while IFS= read -r f; do
+        found+=("$f")
+      done < <(find "$t" -type f \( -name '*.bak*' -o -name '*.backup' -o -name '*.disabled.*' -o -name '*~' \) -mtime +"$days" 2>/dev/null)
+    fi
+  done
+
+  if (( ${#found[@]} == 0 )); then
+    echo "prune: no backup/disabled files older than ${days} days"
+    return 0
+  fi
+
+  local file
+  for file in "${found[@]}"; do
+    rm -f "$file"
+  done
+
+  echo "prune: deleted ${#found[@]} files older than ${days} days"
+}
+
+cmd_preflight() {
+  local failures=0
+
+  if command -v git >/dev/null 2>&1; then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local branch
+      branch="$(git branch --show-current 2>/dev/null || true)"
+      local dirty
+      dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+      echo "preflight_git_branch=${branch:-unknown}"
+      echo "preflight_git_dirty=${dirty}"
+    else
+      echo "[WARN] preflight: current directory is not a git repo"
+    fi
+  else
+    echo "[FAIL] preflight: git not found"
+    failures=$((failures + 1))
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -i :8317 -P 2>/dev/null | grep -q LISTEN; then
+      echo "preflight_port_8317=LISTENING"
+    else
+      echo "preflight_port_8317=NOT_LISTENING"
+      echo "hint: brew services start cliproxyapi"
+    fi
+
+    if lsof -i :4105 -P 2>/dev/null | grep -q LISTEN; then
+      echo "preflight_port_4105=LISTENING"
+    else
+      echo "preflight_port_4105=NOT_LISTENING"
+      echo "hint: start ai-fleet-gateway service"
+    fi
+  else
+    echo "[WARN] preflight: lsof not found, skipping port checks"
+  fi
+
+  local bin
+  if ! bin="$(resolve_ai_coordinator)"; then
+    echo "[FAIL] preflight: ai-coordinator not found"
+    echo "install with: $COORDINATOR_INSTALL_HINT"
+    failures=$((failures + 1))
+  else
+    echo "preflight_ai_coordinator=$bin"
+  fi
+
+  if (( failures > 0 )); then
+    echo "preflight_result=FAILED failures=${failures}"
+    return 1
+  fi
+
+  echo "preflight_result=PASSED"
+}
+
+cmd_doctor() {
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  local failures=0
+  local gw_key
+  gw_key="$(gateway_api_key)"
+
+  # Collect all health data in one python call for both human and JSON output
+  local health_json
+  health_json="$(curl -sS -m 6 "${GATEWAY_URL}/v1/health" 2>/dev/null || true)"
+
+  local gateway_reachable=0
+  if curl -sS -m 4 "${GATEWAY_URL}/v1/health" >/dev/null 2>&1; then
+    gateway_reachable=1
+  fi
+
+  # Delegate all output (human or JSON) to python for consistency
+  python3 - "$health_json" "$gw_key" "$gateway_reachable" "$json_mode" "$GATEWAY_URL" <<'PY'
+import json, sys, datetime
+
+raw = (sys.argv[1] or "").strip()
+gw_key = (sys.argv[2] or "").strip()
+gateway_reachable = sys.argv[3] == "1"
+json_mode = sys.argv[4] == "1"
+gateway_url = sys.argv[5]
+
+checks = []
+fails = 0
+
+def add_check(name, status, message="", detail=None):
+    global fails
+    entry = {"name": name, "status": status, "message": message}
+    if detail is not None:
+        entry["detail"] = detail
+    checks.append(entry)
+    if status == "fail":
+        fails += 1
+
+# Gateway reachable
+if gateway_reachable:
+    add_check("gateway", "pass", f"gateway reachable on {gateway_url}")
+else:
+    add_check("gateway", "fail", f"gateway unreachable on {gateway_url}")
+
+if raw:
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        add_check("gateway_json", "fail", "gateway returned invalid JSON")
+        obj = None
+else:
+    obj = None
+    add_check("gateway_health", "fail", "could not fetch gateway health")
+
+if obj is not None:
+    # LiteLLM / Claude
+    claude = obj.get("claude") or {}
+    if claude.get("litellm_ok"):
+        add_check("claude_litellm", "pass", "claude/litellm proxy reachable")
+    else:
+        err = claude.get("litellm_error", "")
+        add_check("claude_litellm", "fail",
+                   f"claude/litellm proxy down{': ' + err if err else ''}")
+
+    # Codex profiles
+    codex = obj.get("codex") or {}
+    codex_profiles = codex.get("profiles") or []
+    codex_ok = sum(1 for p in codex_profiles if p.get("auth_exists"))
+    if codex_ok > 0:
+        add_check("codex", "pass", f"codex: {codex_ok} profile(s) with auth",
+                   detail={"authenticated_profiles": codex_ok, "total_profiles": len(codex_profiles)})
+    else:
+        add_check("codex", "fail", "codex: no profiles with auth.json",
+                   detail={"authenticated_profiles": 0, "total_profiles": len(codex_profiles)})
+
+    # Gemini profiles
+    gemini = obj.get("gemini") or {}
+    gemini_profiles = gemini.get("profiles") or []
+    gemini_ok = sum(1 for p in gemini_profiles if p.get("home_exists"))
+    if gemini_ok > 0:
+        add_check("gemini", "pass", f"gemini: {gemini_ok} profile(s) healthy",
+                   detail={"healthy_profiles": gemini_ok, "total_profiles": len(gemini_profiles)})
+    else:
+        add_check("gemini", "fail", "gemini: no profiles with valid home",
+                   detail={"healthy_profiles": 0, "total_profiles": len(gemini_profiles)})
+
+    # External providers
+    for p in obj.get("external_providers", []):
+        name = p.get("name", "?")
+        if p.get("enabled") and p.get("key_present"):
+            add_check(f"provider_{name}", "pass", f"{name}: enabled + key present")
+        elif p.get("enabled") and not p.get("key_present"):
+            add_check(f"provider_{name}", "fail", f"{name}: enabled but missing API key")
+        else:
+            add_check(f"provider_{name}", "skip", f"{name}: disabled")
+
+    # API key
+    if gw_key:
+        add_check("gateway_api_key", "pass", "gateway API key configured")
+    else:
+        add_check("gateway_api_key", "fail",
+                   "gateway API key missing (~/.ai-fleet/gateway.json)")
+
+if json_mode:
+    result = "ALL_GOOD" if fails == 0 else "ISSUES_FOUND"
+    output = {
+        "doctor_result": result,
+        "failures": fails,
+        "checks": checks,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "gateway_url": gateway_url,
+    }
+    print(json.dumps(output, indent=2))
+else:
+    for c in checks:
+        tag = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP"}.get(c["status"], "????")
+        print(f"[{tag}] {c['message']}")
+    print()
+    if fails > 0:
+        print(f"doctor_result=ISSUES_FOUND failures={fails}")
+    else:
+        print("doctor_result=ALL_GOOD")
+
+sys.exit(fails)
+PY
+  local py_rc=$?
+  failures=$((failures + py_rc))
+  return $( (( failures > 0 )) && echo 1 || echo 0 )
+}
+
+cmd_profiles() {
+  if ! command -v ai-codex-profile >/dev/null 2>&1; then
+    echo "ai-codex-profile not found on PATH"
+    exit 1
+  fi
+  ai-codex-profile "$@"
+}
+
+cmd_gemini_profiles() {
+  if ! command -v ai-gemini-profile >/dev/null 2>&1; then
+    echo "ai-gemini-profile not found on PATH"
+    exit 1
+  fi
+  ai-gemini-profile "$@"
+}
+
+run_coordinator() {
+  local bin="$1"
+  shift
+  local py_path="$REPO_ROOT/fleet:$REPO_ROOT"
+  if [[ -n "${PYTHONPATH:-}" ]]; then
+    py_path="$py_path:$PYTHONPATH"
+  fi
+  PYTHONPATH="$py_path" "$bin" "$@"
+}
+
+cmd_coordinator() {
+  local bin
+  if ! bin="$(resolve_ai_coordinator)"; then
+    echo "ai-coordinator not found"
+    echo "install with: $COORDINATOR_INSTALL_HINT"
+    exit 1
+  fi
+  run_coordinator "$bin" "$@"
+}
+
+cmd_pipeline() {
+  local subcmd="${1:-list}"
+  shift || true
+  local bin
+  if ! bin="$(resolve_ai_coordinator)"; then
+    echo "ai-coordinator not found"
+    echo "install with: $COORDINATOR_INSTALL_HINT"
+    exit 1
+  fi
+  run_coordinator "$bin" pipeline "$subcmd" "$@"
+}
+
+fleetmax_should_latch_safe_mode() {
+  # Match infra-layer failure signatures that indicate Task/worktree/tool dispatch fragility.
+  local text="${1:-}"
+  [[ -z "$text" ]] && return 1
+
+  local patterns=(
+    "environment_tool_registry_unhealthy"
+    "tool registry degraded"
+    "Tool stub cap reached"
+    "failed_unknown_termination"
+    "Session terminated without completion marker"
+    "No worktree available"
+    "Failed to create feature branch"
+    "git config\.lock"
+    "orchestrator.*unreachable"
+    "tool[- ]reference.*not found"
+    "not found in available tools"
+  )
+
+  local p
+  for p in "${patterns[@]}"; do
+    if printf '%s' "$text" | grep -qiE "$p"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+latch_fleetmax_safe_mode() {
+  local reason="${1:-runtime infra failure signature}"
+  export FLEETMAX_SAFE_MODE=1
+  export FLEETMAX_SAFE_MODE_REASON="$reason"
+  echo "safe_mode=enabled reason=$reason"
+}
+
+cmd_fleetmax_canary() {
+  # Pre-dispatch canary: verify orchestrator and subagent dispatch health
+  # Returns 0 on success, 1 on failure (sets FLEETMAX_SAFE_MODE=1)
+  local canary_endpoint="http://127.0.0.1:8318/status"
+  local canary_result
+
+  # Check 1: Orchestrator reachable
+  canary_result=$(curl -sS -m 5 "$canary_endpoint" 2>/dev/null) || {
+    echo "canary_fail=orchestrator_unreachable endpoint=$canary_endpoint"
+    echo "safe_mode=enabled reason=orchestrator_health_gate"
+    export FLEETMAX_SAFE_MODE=1
+    export FLEETMAX_SAFE_MODE_REASON="orchestrator unreachable at $canary_endpoint"
+    return 1
+  }
+
+  # Check 2: Git config lock (causes worktree failures)
+  local repo_dir
+  repo_dir=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+  if [[ -f "$repo_dir/.git/config.lock" ]]; then
+    echo "canary_fail=git_config_locked path=$repo_dir/.git/config.lock"
+    echo "safe_mode=enabled reason=git_config_lock"
+    export FLEETMAX_SAFE_MODE=1
+    export FLEETMAX_SAFE_MODE_REASON="git config.lock exists at $repo_dir/.git/config.lock"
+    return 1
+  fi
+
+  echo "canary_pass=all_checks"
+  return 0
+}
+
+cmd_fleetmax() {
+  cmd_preflight || {
+    echo "error=preflight failed; resolve issues and retry ai-fleet fleetmax"
+    return 1
+  }
+
+  # Safe-mode canary: check orchestrator + git health before dispatch
+  cmd_fleetmax_canary || {
+    echo "warn: canary failed — fleetmax will run in safe mode (no Task fan-out)"
+    echo "safe_mode_reason=${FLEETMAX_SAFE_MODE_REASON:-unknown}"
+  }
+
+  local repo="."
+  local title=""
+  local executor="${FLEETMAX_EXECUTOR:-native}"
+  local local_sensitive="0"
+  local local_model="${FLEETMAX_LOCAL_MODEL:-qwen2.5:7b-instruct-q4_K_M}"
+  local local_base_url="${FLEETMAX_LOCAL_BASE_URL:-http://100.118.31.21:11434}"
+  local objective_parts=()
+
+  local args=("$@")
+  local i=0
+  while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
+      --repo)
+        i=$((i + 1))
+        repo="${args[$i]:-.}"
+        ;;
+      --title)
+        i=$((i + 1))
+        title="${args[$i]:-}"
+        ;;
+      --executor)
+        i=$((i + 1))
+        executor="${args[$i]:-native}"
+        ;;
+      --local-sensitive)
+        local_sensitive="1"
+        ;;
+      --local-model)
+        i=$((i + 1))
+        local_model="${args[$i]:-qwen2.5:7b-instruct-q4_K_M}"
+        ;;
+      --local-base-url)
+        i=$((i + 1))
+        local_base_url="${args[$i]:-http://100.118.31.21:11434/v1}"
+        ;;
+      *)
+        objective_parts+=("${args[$i]}")
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [[ "$executor" != "native" && "$executor" != "ao" ]]; then
+    echo "error=unsupported executor: $executor (expected native|ao)"
+    exit 1
+  fi
+
+  if [[ "$executor" == "ao" ]]; then
+    if ! command -v ao >/dev/null 2>&1; then
+      echo "error=executor ao requested but 'ao' CLI not found"
+      echo "install_hint=git clone https://github.com/ComposioHQ/agent-orchestrator ~/.ai-fleet/vendor/agent-orchestrator && bash ~/.ai-fleet/vendor/agent-orchestrator/scripts/setup.sh"
+      exit 1
+    fi
+    export FLEETMAX_EXECUTOR=ao
+  else
+    export FLEETMAX_EXECUTOR=native
+  fi
+
+  local objective
+  objective="${objective_parts[*]-}"
+  if [[ -z "$objective" ]]; then
+    echo "Usage: ai-fleet fleetmax \"<objective>\" [--repo <path>] [--title <title>] [--executor native|ao] [--local-sensitive] [--local-model <model>] [--local-base-url <url>]"
+    exit 1
+  fi
+
+  if [[ "$local_sensitive" == "1" ]]; then
+    export FLEETMAX_LOCAL_SENSITIVE=1
+    export FLEETMAX_LOCAL_MODEL="$local_model"
+    export FLEETMAX_LOCAL_BASE_URL="$local_base_url"
+  fi
+
+  export FLEETMAX_LOCAL_SENSITIVE="${FLEETMAX_LOCAL_SENSITIVE:-0}"
+  export FLEETMAX_LOCAL_MODEL="${FLEETMAX_LOCAL_MODEL:-$local_model}"
+  export FLEETMAX_LOCAL_BASE_URL="${FLEETMAX_LOCAL_BASE_URL:-$local_base_url}"
+
+  if [[ "$executor" == "ao" ]]; then
+    title="[AO] ${title:-Fleetmax: ${objective:0:72}}"
+  fi
+
+  if [[ -z "$title" ]]; then
+    title="Fleetmax: ${objective:0:80}"
+  fi
+
+  if [[ "$title" =~ ^\[AO\]\  && "$executor" != "ao" ]]; then
+    title="Fleetmax: ${objective:0:80}"
+  fi
+
+  if [[ ! -d "$repo" ]]; then
+    echo "error=repo path not found: $repo"
+    exit 1
+  fi
+
+  if [[ "$title" =~ ^[[:space:]]*$ ]]; then
+    title="Fleetmax: ${objective:0:80}"
+  fi
+
+  title="${title//$'\n'/ }"
+
+  local bin
+  if ! bin="$(resolve_ai_coordinator)"; then
+    echo "ai-coordinator not found"
+    echo "install with: $COORDINATOR_INSTALL_HINT"
+    exit 1
+  fi
+
+  if [[ "$FLEETMAX_LOCAL_SENSITIVE" == "1" ]]; then
+    echo "local_sensitive=enabled"
+    echo "local_model=$FLEETMAX_LOCAL_MODEL"
+    echo "local_base_url=$FLEETMAX_LOCAL_BASE_URL"
+    export AIFLEET_STAGE_TIMEOUT_REFINE="${AIFLEET_STAGE_TIMEOUT_REFINE:-900}"
+    export AIFLEET_STAGE_TIMEOUT_RESEARCH="${AIFLEET_STAGE_TIMEOUT_RESEARCH:-1200}"
+    export AIFLEET_STAGE_TIMEOUT_SPEC="${AIFLEET_STAGE_TIMEOUT_SPEC:-900}"
+  fi
+
+  export AIFLEET_STAGE_TIMEOUT_REFINE="${AIFLEET_STAGE_TIMEOUT_REFINE:-300}"
+  export AIFLEET_STAGE_TIMEOUT_RESEARCH="${AIFLEET_STAGE_TIMEOUT_RESEARCH:-300}"
+  export AIFLEET_STAGE_TIMEOUT_SPEC="${AIFLEET_STAGE_TIMEOUT_SPEC:-300}"
+
+  if [[ "$FLEETMAX_LOCAL_SENSITIVE" == "1" ]]; then
+    echo "local_timeouts=refine:${AIFLEET_STAGE_TIMEOUT_REFINE}s,research:${AIFLEET_STAGE_TIMEOUT_RESEARCH}s,spec:${AIFLEET_STAGE_TIMEOUT_SPEC}s"
+  fi
+
+  local pipeline_config
+  if [[ "$FLEETMAX_LOCAL_SENSITIVE" == "1" ]]; then
+    pipeline_config=$(python3 -c 'import json,sys; print(json.dumps({"executor": sys.argv[1], "local_sensitive": True, "local_model": sys.argv[2], "local_base_url": sys.argv[3]}))' "$executor" "$FLEETMAX_LOCAL_MODEL" "$FLEETMAX_LOCAL_BASE_URL")
+  else
+    pipeline_config=$(python3 -c 'import json,sys; print(json.dumps({"executor": sys.argv[1]}))' "$executor")
+  fi
+
+  local create_out
+  create_out=$(run_coordinator "$bin" pipeline create --type fleetmax --repo "$repo" --title "$title" --objective "$objective" --config "$pipeline_config" 2>&1) || {
+    echo "$create_out"
+    exit 1
+  }
+
+  local pipeline_id
+  pipeline_id=$(printf '%s\n' "$create_out" | python3 -c 'import sys,re; s=sys.stdin.read(); m=re.search(r"pipeline_id=([\w-]+)", s); print(m.group(1) if m else "")')
+  if [[ -z "$pipeline_id" ]]; then
+    echo "$create_out"
+    echo "error=failed to parse pipeline_id"
+    exit 1
+  fi
+
+  echo "$create_out"
+  echo "executor=$executor"
+  echo "running_pipeline=$pipeline_id"
+  local run_out
+  run_out=$(run_coordinator "$bin" pipeline run "$pipeline_id" 2>&1) || {
+    echo "$run_out"
+    if fleetmax_should_latch_safe_mode "$run_out"; then
+      latch_fleetmax_safe_mode "runtime_dispatch_failure_signature"
+      echo "warn: retrying in safe mode with coordinator main-thread path"
+      run_out=$(run_coordinator "$bin" exec --repo "$repo" --objective "$objective" --via claude 2>&1) || true
+      echo "$run_out"
+    fi
+  }
+  if [[ -n "$run_out" ]]; then
+    echo "$run_out"
+  fi
+
+  local status_out
+  status_out=$(run_coordinator "$bin" pipeline status "$pipeline_id" 2>&1 || true)
+  if fleetmax_should_latch_safe_mode "$status_out"; then
+    latch_fleetmax_safe_mode "runtime_status_detected_dispatch_failure"
+  fi
+  local wait_stage
+  wait_stage=$(printf '%s\n' "$status_out" | python3 -c 'import sys,re; s=sys.stdin.read(); m=re.search(r"\s[🟡]?\s*([a-z_]+)\s+cycle=.*waiting_human", s); print(m.group(1) if m else "")')
+  if [[ -n "$wait_stage" ]]; then
+    echo ""
+    echo "gate_waiting_stage=$wait_stage"
+    echo "resume_with=ai-fleet pipeline approve $pipeline_id --input \"approved\" && ai-fleet pipeline run $pipeline_id"
+  fi
+
+  # Report safe-mode status if latched
+  if [[ "${FLEETMAX_SAFE_MODE:-0}" == "1" ]]; then
+    echo ""
+    echo "═══ SAFE MODE REPORT ═══"
+    echo "safe_mode=active"
+    echo "reason=${FLEETMAX_SAFE_MODE_REASON:-unknown}"
+    echo "behavior=main_thread_only (no Task fan-out, no worktree isolation)"
+    echo "═══════════════════════"
+  fi
+
+  return 0
+}
+
+cmd_keys() {
+  local bin
+  if ! bin="$(resolve_ai_coordinator)"; then
+    echo "ai-coordinator not found"
+    echo "install with: $COORDINATOR_INSTALL_HINT"
+    exit 1
+  fi
+
+  local op="${1:-status}"
+  shift || true
+  case "$op" in
+    status|list)
+      "$bin" auth key-status
+      ;;
+    set)
+      "$bin" auth key-set "$@"
+      ;;
+    clear|unset|remove)
+      "$bin" auth key-clear "$@"
+      ;;
+    *)
+      # passthrough fallback
+      "$bin" auth "$op" "$@"
+      ;;
+  esac
+}
+
+cmd_ui() {
+  local ui_script="$REPO_ROOT/ui/ai_fleet_ui.py"
+  if [[ -f "$ui_script" ]]; then
+    exec python3 "$ui_script" "$@"
+  fi
+  if command -v ai-fleet-ui >/dev/null 2>&1; then
+    exec ai-fleet-ui "$@"
+  fi
+  echo "ai-fleet UI script not found"
+  echo "expected=$ui_script"
+  exit 1
+}
+
+cmd_monitor() {
+  local interval="${1:-10}"
+  local once_flag="${2:-}"
+
+  if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+    echo "interval must be an integer number of seconds"
+    exit 1
+  fi
+
+  while true; do
+    if [[ "$once_flag" != "--once" ]]; then
+      clear
+    fi
+
+    local now_human
+    now_human=$(human_now)
+
+    # Try to detect fleet run directory
+    local fleet_run_dir=""
+    if [[ -d "$FLEET_HOME/runs" ]]; then
+      fleet_run_dir=$(ls -td "$FLEET_HOME/runs"/*/ 2>/dev/null | head -1)
+    fi
+
+    local fleet_id="unknown"
+    if [[ -n "$fleet_run_dir" ]]; then
+      fleet_id=$(basename "$fleet_run_dir")
+    fi
+
+    echo "═══════════════════════════════════════════════════════════"
+    echo "AI FLEET MONITOR — $fleet_id"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+
+    # CLAUDE AGENTS section
+    echo "CLAUDE AGENTS:"
+    echo "┌──────────────────┬───────┬────────┬────────────────────┐"
+    echo "│ Project          │ PID   │ Status │ Last Git Activity  │"
+    echo "├──────────────────┼───────┼────────┼────────────────────┤"
+
+    # Read PIDs from tracking file (may not exist yet)
+    local pids_found=0
+    if [[ -n "$fleet_run_dir" && -f "$fleet_run_dir/pids.json" ]]; then
+      # Parse pids.json using python
+      python3 - "$fleet_run_dir/pids.json" <<'PY'
+import json, os, sys, subprocess
+from pathlib import Path
+
+pids_file = sys.argv[1]
+try:
+    pids = json.loads(Path(pids_file).read_text())
+except Exception:
+    pids = {}
+
+for project, pid_data in pids.items():
+    pid = pid_data.get("pid", "")
+    project_dir = pid_data.get("project_dir", "")
+
+    # Check if process is alive
+    status = "✗ DONE"
+    try:
+        os.kill(int(pid), 0)
+        status = "✓ ALIVE"
+    except (OSError, ValueError):
+        pass
+
+    # Get last git activity
+    git_activity = "—"
+    if project_dir and os.path.isdir(project_dir):
+        try:
+            result = subprocess.run(
+                ["git", "-C", project_dir, "log", "-1", "--pretty=format:%ar: %s"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                git_activity = result.stdout.strip()[:40]
+        except Exception:
+            pass
+
+    # Format output
+    print(f"│ {project[:16]:<16} │ {pid[:5]:<5} │ {status:<6} │ {git_activity[:18]:<18} │")
+PY
+      pids_found=1
+    fi
+
+    if [[ $pids_found -eq 0 ]]; then
+      echo "│ (no agents)      │ —     │ —      │ —                  │"
+    fi
+
+    echo "└──────────────────┴───────┴────────┴────────────────────┘"
+    echo
+
+    # CODEX QUEUE section
+    echo "CODEX QUEUE:"
+    echo "┌──────────────┬──────────┬──────┬─────────┐"
+    echo "│ Task ID      │ Project  │ Exit │ Tokens  │"
+    echo "├──────────────┼──────────┼──────┼─────────┤"
+
+    # Read Codex queue from coordinator DB
+    local db_path="$HOME/.ai-fleet/coordinator/memory.db"
+    local queue_found=0
+    if [[ -f "$db_path" ]]; then
+      python3 - "$db_path" <<'PY'
+import sqlite3, sys
+from pathlib import Path
+
+db_path = sys.argv[1]
+try:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.execute("""
+        SELECT task_id, COALESCE(repo, '.'), exit_code, ''
+        FROM task_queue
+        WHERE status IN ('running', 'completed')
+        ORDER BY submitted_at DESC
+        LIMIT 5
+    """)
+    rows = cursor.fetchall()
+    if rows:
+        for task_id, repo, exit_code, tokens in rows:
+            project = Path(repo).name if repo else "—"
+            exit_str = str(exit_code) if exit_code is not None else "—"
+            tokens_str = tokens or "—"
+            print(f"│ {task_id[:12]:<12} │ {project[:8]:<8} │ {exit_str[:4]:<4} │ {tokens_str[:7]:<7} │")
+    else:
+        print("│ (no tasks)   │ —        │ —    │ —       │")
+    conn.close()
+except Exception as e:
+    print(f"│ (db error)   │ —        │ —    │ —       │")
+PY
+      queue_found=1
+    fi
+
+    if [[ $queue_found -eq 0 ]]; then
+      echo "│ (no db)      │ —        │ —    │ —       │"
+    fi
+
+    echo "└──────────────┴──────────┴──────┴─────────┘"
+    echo
+
+    if [[ "$once_flag" == "--once" ]]; then
+      echo "Last refresh: $now_human"
+      break
+    else
+      local next_refresh
+      next_refresh=$(date -v +${interval}S '+%H:%M:%S' 2>/dev/null || date -d "+${interval} seconds" '+%H:%M:%S')
+      echo "Last refresh: $(date '+%H:%M:%S') | Next: $next_refresh"
+      sleep "$interval"
+    fi
+  done
+}
+
+cmd_setup_check() {
+  # Non-interactive health verification
+  local all_ok=1
+
+  # Gateway
+  if curl -sS -m 3 "${GATEWAY_URL}/v1/health" >/dev/null 2>&1; then
+    echo "[PASS] gateway responding on $GATEWAY_URL"
+  else
+    echo "[FAIL] gateway not responding on $GATEWAY_URL"
+    all_ok=0
+  fi
+
+  # Coordinator DB
+  local db_path="$HOME/.ai-fleet/coordinator/memory.db"
+  if [[ -f "$db_path" ]]; then
+    echo "[PASS] coordinator database exists"
+  else
+    echo "[FAIL] coordinator database not found at $db_path"
+    all_ok=0
+  fi
+
+  # Required commands
+  for dep in python3 curl jq; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      echo "[PASS] $dep found"
+    else
+      echo "[FAIL] $dep not found"
+      all_ok=0
+    fi
+  done
+
+  # AI CLI tools
+  for dep in claude codex; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      echo "[PASS] $dep found"
+    else
+      echo "[WARN] $dep not found (optional)"
+    fi
+  done
+
+  # Plist
+  local plist_dst="$HOME/Library/LaunchAgents/com.ai.fleet.gateway.plist"
+  if [[ -f "$plist_dst" ]]; then
+    echo "[PASS] launchd plist installed"
+  else
+    echo "[WARN] launchd plist not installed at $plist_dst"
+  fi
+
+  if (( all_ok )); then
+    echo
+    echo "All required checks passed."
+    return 0
+  else
+    echo
+    echo "Some checks failed. Run 'ai-fleet setup' to fix."
+    return 1
+  fi
+}
+
+cmd_setup_docker() {
+  # Generate docker-compose.yml with correct paths
+  local compose_dst="$REPO_ROOT/docker-compose.yml"
+
+  if [[ -f "$compose_dst" ]]; then
+    echo "docker-compose.yml already exists at $compose_dst"
+    echo "Remove it first to regenerate."
+    return 1
+  fi
+
+  cat > "$compose_dst" <<COMPOSE
+version: "3.8"
+
+services:
+  ai-fleet:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ai-fleet
+    restart: unless-stopped
+    ports:
+      - "4105:4105"
+      - "4585:4585"
+    volumes:
+      - ai-fleet-state:/root/.ai-fleet
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AI_FLEET_ROOT=/app
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4105/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ai-fleet-state:
+    driver: local
+COMPOSE
+
+  echo "Generated $compose_dst"
+  echo
+  echo "Next steps:"
+  echo "  docker compose up -d     Start AI Fleet in Docker"
+  echo "  docker compose logs -f   Watch logs"
+  echo "  docker compose down      Stop"
+}
+
+cmd_setup() {
+  # Handle flags
+  case "${1:-}" in
+    --check)
+      cmd_setup_check
+      return $?
+      ;;
+    --docker)
+      cmd_setup_docker
+      return $?
+      ;;
+  esac
+
+  echo "AI Fleet Setup Wizard"
+  echo "====================="
+  echo
+
+  # Step 1: Dependencies
+  echo "Step 1/7: Dependencies"
+  printf '%-12s %-8s %s\n' 'command' 'status' 'path'
+  printf '%-12s %-8s %s\n' '-------' '------' '----'
+  local missing_required=0
+  for dep in python3 curl jq; do
+    local dep_path
+    dep_path="$(command -v "$dep" 2>/dev/null || true)"
+    if [[ -n "$dep_path" ]]; then
+      printf '%-12s %-8s %s\n' "$dep" "ok" "$dep_path"
+    else
+      printf '%-12s %-8s %s\n' "$dep" "MISSING" "(required)"
+      missing_required=1
+    fi
+  done
+  for dep in claude codex gemini droid; do
+    local dep_path
+    dep_path="$(command -v "$dep" 2>/dev/null || true)"
+    if [[ -n "$dep_path" ]]; then
+      printf '%-12s %-8s %s\n' "$dep" "ok" "$dep_path"
+    else
+      printf '%-12s %-8s %s\n' "$dep" "missing" "(optional)"
+    fi
+  done
+  if (( missing_required )); then
+    echo
+    echo "[FAIL] required dependencies missing — install them first"
+    return 1
+  fi
+  echo
+
+  # Step 2: Install
+  echo "Step 2/7: Install"
+  local wrapper="$HOME/.local/bin/ai-fleet"
+  if [[ -x "$wrapper" ]] && grep -q "$REPO_ROOT" "$wrapper" 2>/dev/null; then
+    echo "[SKIP] ai-fleet already installed at $wrapper"
+  else
+    echo "Installing ai-fleet wrappers..."
+    bash "$REPO_ROOT/install.sh"
+    echo "[DONE] install complete"
+  fi
+  echo
+
+  # Step 3: Gateway daemon
+  echo "Step 3/7: Gateway daemon"
+  local plist_dst="$HOME/Library/LaunchAgents/com.ai.fleet.gateway.plist"
+  local plist_src="$REPO_ROOT/launchd/com.ai.fleet.gateway.plist"
+  if [[ -f "$plist_dst" ]] && grep -q "$REPO_ROOT" "$plist_dst" 2>/dev/null; then
+    echo "[SKIP] plist already installed at $plist_dst"
+  elif [[ -f "$plist_src" ]]; then
+    mkdir -p "$HOME/.ai-fleet/logs"
+    sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" -e "s|__HOME__|$HOME|g" "$plist_src" > "$plist_dst"
+    launchctl bootout "gui/$(id -u)/com.ai.fleet.gateway" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist_dst"
+    echo "[DONE] plist installed and gateway bootstrapped"
+  else
+    echo "[WARN] plist template not found at $plist_src"
+  fi
+
+  # Wait for gateway to respond
+  local gw_ok=0
+  for i in 1 2 3 4 5; do
+    if curl -sS -m 2 "${GATEWAY_URL}/v1/health" >/dev/null 2>&1; then
+      gw_ok=1
+      break
+    fi
+    sleep 1
+  done
+  if (( gw_ok )); then
+    echo "[PASS] gateway responding on $GATEWAY_URL"
+  else
+    echo "[WARN] gateway not responding on $GATEWAY_URL after 5s"
+    echo "       try: launchctl kickstart -k gui/$(id -u)/com.ai.fleet.gateway"
+  fi
+  echo
+
+  # Step 4: Auth scaffold
+  echo "Step 4/7: Auth scaffold"
+  if command -v ai-auth-manage >/dev/null 2>&1; then
+    ai-auth-manage init 2>/dev/null && echo "[DONE] auth scaffold initialized" || echo "[WARN] ai-auth-manage init returned non-zero"
+  else
+    echo "[SKIP] ai-auth-manage not found"
+  fi
+  echo
+
+  # Step 5: Provider auth
+  echo "Step 5/7: Provider auth"
+
+  # Auto-create coordinator config if missing
+  if [[ ! -f "$HOME/.ai-fleet/coordinator.json" ]]; then
+    if [[ -f "$REPO_ROOT/coordinator/coordinator.default.json" ]]; then
+      printf "Creating coordinator config from defaults...\n"
+      cp "$REPO_ROOT/coordinator/coordinator.default.json" "$HOME/.ai-fleet/coordinator.json"
+      printf "[OK] Coordinator config created at ~/.ai-fleet/coordinator.json\n"
+    fi
+  fi
+
+  # Auto-discover codex profiles
+  printf "\n--- Discovered Profiles ---\n"
+  local found_profiles=0
+  for d in "$HOME/.codex" "$HOME/.codex-"*; do
+    if [[ -d "$d" ]]; then
+      local name
+      name=$(basename "$d" | sed 's/^\.//')
+      if [[ -f "$d/auth.json" ]]; then
+        printf "[OK] Codex profile: %s (authenticated)\n" "$name"
+      else
+        printf "[--] Codex profile: %s (not logged in)\n" "$name"
+      fi
+      found_profiles=$((found_profiles + 1))
+    fi
+  done
+
+  if [[ "$found_profiles" -eq 0 ]]; then
+    printf "No Codex profiles found. Run: codex auth login\n"
+  fi
+
+  # Check Claude CLI
+  if command -v claude &>/dev/null; then
+    printf "[OK] Claude CLI available\n"
+  else
+    printf "[--] Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code\n"
+  fi
+
+  if command -v ai-codex-profile >/dev/null 2>&1; then
+    echo "Codex profiles:"
+    ai-codex-profile list 2>/dev/null || echo "  (none)"
+  fi
+  if command -v ai-gemini-profile >/dev/null 2>&1; then
+    echo "Gemini profiles:"
+    ai-gemini-profile list 2>/dev/null || echo "  (none)"
+  fi
+
+  local health_json
+  health_json="$(curl -sS -m 6 "${GATEWAY_URL}/v1/health" 2>/dev/null || true)"
+  if [[ -n "$health_json" ]]; then
+    python3 - "$health_json" <<'PY'
+import json, sys
+raw = (sys.argv[1] or "").strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+for p in obj.get("external_providers", []):
+    name = p.get("name", "?")
+    enabled = p.get("enabled", False)
+    key = p.get("key_present", False)
+    print(f"  {name}: enabled={enabled} key_present={key}")
+PY
+  fi
+
+  # Interactive auth wizard (only in interactive terminal)
+  if [[ -t 0 ]]; then
+    printf "\n--- Provider Authentication ---\n"
+
+    # Codex setup
+    if [[ -d "$HOME/.codex" ]] && [[ ! -f "$HOME/.codex/auth.json" ]]; then
+      printf "Codex profile found but not logged in.\n"
+      printf "Log in now? [Y/n]: "
+      read -r reply
+      if [[ "$reply" != "n" && "$reply" != "N" ]]; then
+        codex auth login 2>&1 || printf "  [WARN] Codex login failed. Run manually: codex auth login\n"
+      fi
+    elif command -v codex &>/dev/null; then
+      printf "[OK] Codex CLI available\n"
+    fi
+
+    # Gemini CLI check
+    if ! command -v gemini &>/dev/null; then
+      printf "Gemini CLI not found. Install? [Y/n]: "
+      read -r reply
+      if [[ "$reply" != "n" && "$reply" != "N" ]]; then
+        pip3 install google-genai 2>&1 || printf "  [WARN] Gemini install failed\n"
+      fi
+    else
+      printf "[OK] Gemini CLI available\n"
+    fi
+
+    # OpenRouter key
+    if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+      printf "OpenRouter API key (get one at https://openrouter.ai/keys, Enter to skip): "
+      read -r key
+      if [[ -n "$key" ]]; then
+        ai-fleet keys set openrouter "$key" --enable 2>&1 || printf "  [WARN] Failed to set key\n"
+      fi
+    else
+      printf "[OK] OpenRouter API key configured\n"
+    fi
+  fi
+
+  echo
+  echo "To log in to a codex profile:  ai-auth-manage codex-login <name>"
+  echo "To log in to a gemini profile: ai-auth-manage gemini-login <name>"
+  echo "To set a provider API key:     ai-fleet keys set <provider> <key> --enable"
+  echo
+
+  # Step 6: Validate
+  echo "Step 6/7: Validate"
+  cmd_doctor || true
+  echo
+
+  # Step 7: Done
+  echo "Step 7/7: Setup Complete"
+  echo
+  echo "Next steps:"
+  echo "  ai-fleet ui --open     Open the web UI"
+  echo "  ai-fleet smoke         Run full smoke tests"
+  echo "  ai-fleet status        View fleet status"
+  echo "  ai-fleet doctor        Quick health check"
+}
+
+cmd_onboard_remote() {
+  local mode="${1:-plan}"
+  local bootstrap="$REPO_ROOT/scripts/remote-bootstrap.sh"
+  local task_script="$REPO_ROOT/scripts/remote-task.sh"
+
+  case "$mode" in
+    run)
+      shift || true
+      local host="${1:-}"
+      shift || true
+      if [[ -z "$host" ]]; then
+        echo "Usage: ai-fleet onboard-remote run <host> [--user <user>] [--control-plane]"
+        return 1
+      fi
+
+      local remote_user=""
+      local enable_control_plane="0"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --user)
+            remote_user="${2:-}"
+            shift 2 || true
+            ;;
+          --control-plane)
+            enable_control_plane="1"
+            shift || true
+            ;;
+          *)
+            echo "Unknown flag: $1"
+            echo "Usage: ai-fleet onboard-remote run <host> [--user <user>] [--control-plane]"
+            return 1
+            ;;
+        esac
+      done
+
+      local target="$host"
+      if [[ -n "$remote_user" ]]; then
+        target="$remote_user@$host"
+      fi
+
+      local remote_cmd='set -euo pipefail; ROOT="${FULLSTACKOS_ROOT:-$HOME/Dev/fullstackOS}"; if [ ! -d "$ROOT" ]; then echo "fullstackOS not found at $ROOT"; exit 1; fi; cd "$ROOT"; git pull --ff-only origin main; ./install.sh --all'
+      if [[ "$enable_control_plane" == "1" ]]; then
+        remote_cmd+="; ./install.sh --control-plane"
+      fi
+      remote_cmd+='; ./install.sh --doctor || true'
+
+      echo "Running remote onboarding on $target"
+      if [[ "$enable_control_plane" == "1" ]]; then
+        echo "Mode: base + control-plane"
+      else
+        echo "Mode: base only (control-plane optional)"
+      fi
+      ssh -o BatchMode=no -o StrictHostKeyChecking=accept-new "$target" "$remote_cmd"
+      ;;
+    plan)
+      cat <<EOF
+Remote onboarding (staggered)
+
+1) Base machine setup (always)
+   ./install.sh --all
+
+2) Optional remote control plane (only if needed)
+   ./install.sh --control-plane
+
+3) Validate
+   ./install.sh --doctor
+
+4) Optional remote task API usage
+   curl -H "Authorization: Bearer <TASK_API_TOKEN>" http://127.0.0.1:4106/v1/tasks
+
+Automation helpers:
+  bootstrap: ${bootstrap}
+  task submit: ${task_script}
+
+One-command remote bootstrap:
+  ai-fleet onboard-remote run <host> [--user <user>] [--control-plane]
+EOF
+      ;;
+    plan)
+      cat <<EOF
+Remote onboarding (staggered)
+
+1) Base machine setup (always)
+   ./install.sh --all
+
+2) Optional remote control plane (only if needed)
+   ./install.sh --control-plane
+
+3) Validate
+   ./install.sh --doctor
+
+4) Optional remote task API usage
+   curl -H "Authorization: Bearer <TASK_API_TOKEN>" http://127.0.0.1:4106/v1/tasks
+
+Automation helpers:
+  bootstrap: ${bootstrap}
+  task submit: ${task_script}
+EOF
+      ;;
+    check)
+      echo "Remote onboarding checks"
+      if [[ -f "$bootstrap" ]]; then echo "[OK] bootstrap script: $bootstrap"; else echo "[MISSING] $bootstrap"; fi
+      if [[ -f "$task_script" ]]; then echo "[OK] task script: $task_script"; else echo "[MISSING] $task_script"; fi
+      if command -v lsof >/dev/null 2>&1 && lsof -i :4106 >/dev/null 2>&1; then
+        echo "[OK] Task API appears to be running on :4106"
+      else
+        echo "[INFO] Task API not running on :4106 (optional; run ./install.sh --control-plane)"
+      fi
+      ;;
+    *)
+      echo "Usage: ai-fleet onboard-remote [plan|check|run <host> [--user <user>] [--control-plane]]"
+      return 1
+      ;;
+  esac
+}
+
+show_help() {
+  cat <<'HELP'
+ai-fleet - Unified local orchestration for Claude + Droid + Codex
+
+Usage: ai-fleet <command> [args]
+
+Commands:
+  setup               Interactive guided setup wizard (first-run onboarding)
+  setup --check       Non-interactive health verification
+  setup --docker      Generate docker-compose.yml for Docker deployment
+  setup-proxy         CLIProxyAPI + smart model routing setup (proxy, OAuth, fallback)
+  setup-proxy --check Validate proxy setup health
+  status              Show stack health + auth load + route recommendation
+  usage [--json]      Show usage + auth load (optional JSON output)
+  load                Show auth load table and recommended auth
+  route               Print recommended auth + gateway route choices
+  profiles [...]      Manage codex profiles (list/add/login/test/detect)
+  gemini-profiles [...] Manage gemini profiles (list/add/test/clone-current)
+  coordinator [...]   Unified coordinator (preflight/gates/learning/swarm)
+  keys [...]          Provider key helpers (status/set/clear via coordinator)
+  ui [--port N]       Start local web UI for auth/profile/key management
+  droid-direct "..."  Run Droid direct path (coordinator-backed with fallback)
+  droid-swarm "..."   Run Droid swarm path (coordinator-backed with fallback)
+  watch [seconds]     Live status/load dashboard (default 15s)
+  monitor [seconds]   Monitor Claude agents + Codex queue (default 10s, --once for single check)
+  preflight           Environment preflight (git/ports/coordinator)
+  doctor [--json]     Quick health check (~2s) — gateway, backends, keys
+  onboard-remote [...] Remote machine onboarding helper (plan/check/run)
+  smoke               End-to-end smoke tests across stack + CLIs
+  team "objective"    Run Codex + Droid (parallel) + Claude synthesis runbook
+  prune [days]        Remove backup/disabled files older than N days (default 14)
+  config validate     Validate coordinator + gateway configs against JSON schemas
+  config migrate      Add missing fields with defaults from schema
+  decisions [...]     Query routing decision audit trail
+  cost [...]          Show cost tracking data (--today/--month/--by-model)
+  explain [...]       Show what routing would happen for an objective (dry-run)
+  auth-health         Show auth health status for all profiles
+  swarm-kill [...]    Kill a running swarm task by run_id
+  runs [...]          Browse run history with filters
+  run <run_id>        Show full detail for a specific run
+  replay <run_id>     Re-execute a previous run with optional overrides
+  budget [...]        Budget cap management (show/set-cap/history/reset)
+  learn [...]         Learning memory operations (query/stats/compact)
+  learnings [...]     Alias for 'learn'
+  snapshot [...]      Create a snapshot of the current state
+  rate-limits [...]   Show rate limit state for all profiles
+  exec [...]          Execute a task (--repo, --objective, --via, --model)
+  submit [...]        Submit a task to the queue (non-blocking)
+  queue [...]         Task queue management (list/cancel/detail/drain)
+  process-queue       Process queue (--workers N for parallel, --drain to empty)
+  notify [...]        Notification channel management
+  notifications [...] Browse notification history
+  pipeline [...]      Pipeline orchestrator (create/list/status/approve/reject/cancel/run)
+  fleetmax "..."      Create + run a fleetmax pipeline (--executor native|ao)
+  fleetmaxao "..."    Shortcut for fleetmax with --executor ao
+  test-failures [...] Query recurring test failures (--limit N)
+  help                Show this help
+
+Pipeline examples:
+  ai-fleet pipeline create --type feature --repo . --title "Add endpoint" --objective "..."
+  ai-fleet pipeline list
+  ai-fleet pipeline status pip_XXXXXXXX
+  ai-fleet fleetmax "Ship auth failover + adversarial hardening" --repo .
+  ai-fleet fleetmax "Deep autonomous repo pass" --repo . --executor ao
+  ai-fleet pipeline approve pip_XXXXXXXX
+  ai-fleet pipeline reject pip_XXXXXXXX --reason "needs redesign"
+  ai-fleet pipeline run pip_XXXXXXXX
+  ai-fleet pipeline cancel pip_XXXXXXXX
+
+Examples:
+  ai-fleet setup
+  ai-fleet preflight
+  ai-fleet doctor
+  ai-fleet status
+  ai-fleet load
+  ai-fleet route
+  ai-fleet profiles list
+  ai-fleet profiles add codex-work ~/.codex-work
+  ai-fleet profiles login codex-work
+  ai-fleet gemini-profiles list
+  ai-fleet gemini-profiles clone-current gemini-alt ~/.gemini-profiles/gemini-alt
+  ai-fleet coordinator status
+  ai-fleet coordinator exec --repo . --objective "fix auth routing" --autonomous
+  ai-fleet keys status
+  ai-fleet keys set openrouter <key> --enable
+  ai-fleet keys clear kimi --disable
+  ai-fleet ui --open
+  ai-fleet ui --port 4585
+  ai-fleet droid-direct "Review this repo and list top risks"
+  ai-fleet droid-swarm "Break this project into parallel workstreams"
+  ai-fleet watch 20
+  ai-fleet monitor
+  ai-fleet monitor 5
+  ai-fleet monitor --once
+  ai-fleet onboard-remote plan
+  ai-fleet onboard-remote check
+  ai-fleet onboard-remote run poe-mac-mini.local --user poe
+  ai-fleet onboard-remote run poe-mac-mini.local --user poe --control-plane
+  ai-fleet smoke
+  ai-fleet team "Ship auth failover and regression tests"
+  ai-fleet prune 14
+HELP
+}
+
+case "${1:-status}" in
+  setup)
+    shift || true
+    cmd_setup "$@"
+    ;;
+  setup-proxy)
+    shift || true
+    exec "$SCRIPT_DIR/ai-fleet-setup-proxy" "$@"
+    ;;
+  status)
+    cmd_status
+    ;;
+  preflight)
+    cmd_preflight
+    ;;
+  usage)
+    shift || true
+    cmd_usage "$@"
+    ;;
+  load)
+    cmd_load
+    ;;
+  route)
+    cmd_route
+    ;;
+  profiles)
+    shift || true
+    cmd_profiles "$@"
+    ;;
+  gemini-profiles)
+    shift || true
+    cmd_gemini_profiles "$@"
+    ;;
+  coordinator)
+    shift || true
+    cmd_coordinator "$@"
+    ;;
+  keys)
+    shift || true
+    cmd_keys "$@"
+    ;;
+  ui)
+    shift || true
+    cmd_ui "$@"
+    ;;
+  droid-direct)
+    shift || true
+    cmd_droid_nexus direct "$@"
+    ;;
+  droid-swarm)
+    shift || true
+    cmd_droid_nexus swarm "$@"
+    ;;
+  watch)
+    shift || true
+    cmd_watch "${1:-15}"
+    ;;
+  monitor)
+    shift || true
+    cmd_monitor "${1:-10}" "${2:-}"
+    ;;
+  doctor)
+    shift || true
+    cmd_doctor "$@"
+    ;;
+  onboard-remote)
+    shift || true
+    cmd_onboard_remote "${1:-plan}"
+    ;;
+  smoke)
+    cmd_smoke
+    ;;
+  team)
+    shift || true
+    cmd_team "$@"
+    ;;
+  prune)
+    shift || true
+    cmd_prune "${1:-14}"
+    ;;
+  config)
+    shift || true
+    cmd_coordinator config "$@"
+    ;;
+  decisions)
+    shift || true
+    cmd_coordinator decisions "$@"
+    ;;
+  cost)
+    shift || true
+    cmd_coordinator cost "$@"
+    ;;
+  explain)
+    shift || true
+    cmd_coordinator explain "$@"
+    ;;
+  auth-health)
+    shift || true
+    cmd_coordinator auth auth-health "$@"
+    ;;
+  swarm-kill)
+    shift || true
+    cmd_coordinator swarm-kill "$@"
+    ;;
+  runs)
+    shift || true
+    cmd_coordinator runs "$@"
+    ;;
+  run)
+    shift || true
+    cmd_coordinator run "$@"
+    ;;
+  replay)
+    shift || true
+    cmd_coordinator replay "$@"
+    ;;
+  budget)
+    shift || true
+    if [[ $# -eq 0 ]]; then
+      cmd_coordinator budget show
+    else
+      cmd_coordinator budget "$@"
+    fi
+    ;;
+  learn|learnings)
+    shift || true
+    cmd_coordinator learn "$@"
+    ;;
+  snapshot)
+    shift || true
+    snap_dir="$HOME/.ai-fleet/coordinator/snapshots"
+    if [[ $# -gt 0 && "$1" == "list" ]]; then
+      ls -lt "$snap_dir"/*.json 2>/dev/null | head -20 || echo "No snapshots found."
+    else
+      echo "Snapshots in $snap_dir:"
+      ls -lt "$snap_dir"/*.json 2>/dev/null | head -10 || echo "  (none)"
+      echo ""
+      echo "Usage: ai-fleet snapshot list"
+    fi
+    ;;
+  rate-limits)
+    shift || true
+    cmd_coordinator rate-limits "$@"
+    ;;
+  proxy-sync)
+    shift || true
+    ensure_cliproxy_service 8317 || exit 1
+    cmd_coordinator proxy-sync "$@"
+    ;;
+  exec)
+    shift || true
+    cmd_coordinator exec "$@"
+    ;;
+  submit)
+    shift || true
+    cmd_coordinator submit "$@"
+    ;;
+  queue)
+    shift || true
+    cmd_coordinator queue "$@"
+    ;;
+  process-queue)
+    shift || true
+    cmd_coordinator process-queue "$@"
+    ;;
+  notify)
+    shift || true
+    cmd_coordinator notify "$@"
+    ;;
+  notifications)
+    shift || true
+    cmd_coordinator notifications "$@"
+    ;;
+  pipeline)
+    shift || true
+    cmd_pipeline "$@"
+    ;;
+  fleetmax)
+    shift || true
+    cmd_fleetmax "$@"
+    ;;
+  fleetmaxao)
+    shift || true
+    cmd_fleetmax "$@" --executor ao
+    ;;
+  test-failures)
+    shift || true
+    python3 "$REPO_ROOT/coordinator/pytest_collector.py" --query "$@"
+    ;;
+  help|-h|--help)
+    show_help
+    ;;
+  *)
+    echo "Unknown command: $1"
+    show_help
+    exit 1
+    ;;
+esac

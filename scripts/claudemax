@@ -1,0 +1,788 @@
+#!/bin/bash
+set -euo pipefail
+
+CLAUDEMAX_BASE_URL_DEFAULT="http://127.0.0.1:8318"
+CLAUDEMAX_API_KEY_DEFAULT="sk-proxy"
+CLAUDEMAX_ALLOW_ANTHROPIC_ENV_OVERRIDE="${CLAUDEMAX_ALLOW_ANTHROPIC_ENV_OVERRIDE:-0}"
+CLAUDEMAX_RECOVER_ORCHESTRATOR="${CLAUDEMAX_RECOVER_ORCHESTRATOR:-1}"
+CLAUDEMAX_FAIL_FAST_ON_AUTH_CONFLICT="${CLAUDEMAX_FAIL_FAST_ON_AUTH_CONFLICT:-1}"
+CLAUDEMAX_LAUNCH_LABEL="com.claudemax.orchestrator"
+CLAUDEMAX_REAL_HOME="${HOME}"
+CLAUDEMAX_LAUNCH_PLIST="${CLAUDEMAX_REAL_HOME}/Library/LaunchAgents/${CLAUDEMAX_LAUNCH_LABEL}.plist"
+CLAUDEMAX_STDOUT_LOG="${CLAUDEMAX_REAL_HOME}/.claudemax/logs/stdout.log"
+CLAUDEMAX_STDERR_LOG="${CLAUDEMAX_REAL_HOME}/.claudemax/logs/stderr.log"
+CLAUDEMAX_CACHE_DIR="${CLAUDEMAX_REAL_HOME}/.claudemax"
+CLAUDEMAX_CACHE_FILE="${CLAUDEMAX_CACHE_DIR}/last-good-model.json"
+CLAUDEMAX_LEGACY_CACHE_FILE="${CLAUDEMAX_CACHE_DIR}/last-good-model"
+CLAUDEMAX_CLAUDE_HOME="${CLAUDEMAX_CLAUDE_HOME:-${CLAUDEMAX_CACHE_DIR}/claude-home}"
+CLAUDEMAX_SHARED_CLAUDE_DIR="${CLAUDEMAX_REAL_HOME}/.claude"
+CLAUDEMAX_SOURCE_STATE_FILE="${CLAUDEMAX_REAL_HOME}/.claude.json"
+CLAUDE_STATE_FILE="${CLAUDEMAX_CLAUDE_HOME}/.claude.json"
+
+AMBIENT_ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL-}"
+AMBIENT_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY-}"
+AMBIENT_ANTHROPIC_ENV_PRESENT=0
+if [[ -n "$AMBIENT_ANTHROPIC_BASE_URL" || -n "$AMBIENT_ANTHROPIC_API_KEY" ]]; then
+    AMBIENT_ANTHROPIC_ENV_PRESENT=1
+fi
+
+if [[ "$CLAUDEMAX_ALLOW_ANTHROPIC_ENV_OVERRIDE" == "1" ]]; then
+    ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-${CLAUDEMAX_BASE_URL:-$CLAUDEMAX_BASE_URL_DEFAULT}}"
+    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-${CLAUDEMAX_API_KEY:-$CLAUDEMAX_API_KEY_DEFAULT}}"
+    CLAUDEMAX_AMBIENT_ENV_IGNORED=0
+else
+    ANTHROPIC_BASE_URL="${CLAUDEMAX_BASE_URL:-$CLAUDEMAX_BASE_URL_DEFAULT}"
+    ANTHROPIC_API_KEY="${CLAUDEMAX_API_KEY:-$CLAUDEMAX_API_KEY_DEFAULT}"
+    CLAUDEMAX_AMBIENT_ENV_IGNORED="$AMBIENT_ANTHROPIC_ENV_PRESENT"
+fi
+
+API_ENDPOINT="${ANTHROPIC_BASE_URL}/v1/messages"
+HEALTH_ENDPOINT="${ANTHROPIC_BASE_URL}/health"
+
+mkdir -p "$CLAUDEMAX_CACHE_DIR"
+
+log() {
+    echo "$*" >&2
+}
+
+warn() {
+    log "⚠ $*"
+}
+
+route_explain() {
+    if [[ "${CLAUDEMAX_ROUTE_EXPLAIN:-0}" == "1" ]]; then
+        log "$*"
+    fi
+}
+
+print_log_tail() {
+    local path="$1"
+    local label="$2"
+    local lines="${3:-20}"
+    if [[ -f "$path" ]]; then
+        log "--- ${label} (${path}) ---"
+        tail -n "$lines" "$path" >&2 || true
+    else
+        route_explain "missing_log=${path}"
+    fi
+}
+
+require_command() {
+    local cmd="$1"
+    local help_text="${2:-Install or expose it on PATH and retry.}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log "Missing required command: $cmd"
+        log "  $help_text"
+        return 1
+    fi
+}
+
+validate_base_url() {
+    python3 - "$ANTHROPIC_BASE_URL" <<'PYCODE'
+from urllib.parse import urlparse
+import sys
+url = urlparse(sys.argv[1])
+if url.scheme not in {'http', 'https'} or not url.netloc:
+    sys.exit(1)
+PYCODE
+}
+
+is_local_orchestrator_target() {
+    python3 - "$ANTHROPIC_BASE_URL" <<'PYCODE'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+host = (u.hostname or '').lower()
+port = u.port or (443 if u.scheme == 'https' else 80)
+if host in {'127.0.0.1', 'localhost'} and port == 8318:
+    print('1')
+    sys.exit(0)
+sys.exit(1)
+PYCODE
+}
+
+canonical_path() {
+    python3 - "$1" <<'PYCODE'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve(strict=False))
+PYCODE
+}
+
+ensure_isolated_home_safe() {
+    local real_home iso_home
+    real_home="$(canonical_path "$CLAUDEMAX_REAL_HOME")"
+    iso_home="$(canonical_path "$CLAUDEMAX_CLAUDE_HOME")"
+    if [[ "$iso_home" == "$real_home" ]]; then
+        log "CLAUDEMAX_CLAUDE_HOME must be different from your normal HOME."
+        log "  real_home: $real_home"
+        log "  claudemax_home: $iso_home"
+        return 1
+    fi
+    if [[ "$CLAUDE_STATE_FILE" == "$CLAUDEMAX_SOURCE_STATE_FILE" ]]; then
+        log "Refusing to reuse the normal Claude state file for claudemax."
+        log "  source_state: $CLAUDEMAX_SOURCE_STATE_FILE"
+        log "  claudemax_state: $CLAUDE_STATE_FILE"
+        return 1
+    fi
+    return 0
+}
+
+link_shared_entry() {
+    local name="$1"
+    local src="${CLAUDEMAX_REAL_HOME}/${name}"
+    local dest="${CLAUDEMAX_CLAUDE_HOME}/${name}"
+    local current_target backup_path
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+        return 0
+    fi
+    if [[ -L "$dest" ]]; then
+        current_target="$(readlink "$dest" 2>/dev/null || true)"
+        if [[ "$current_target" == "$src" ]]; then
+            return 0
+        fi
+    fi
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        backup_path="${dest}.bak.$(date +%s)"
+        mv "$dest" "$backup_path"
+        route_explain "claudemax_profile_conflict path=${dest} backup=${backup_path}"
+    fi
+    ln -s "$src" "$dest" >/dev/null 2>&1 || true
+}
+
+prepare_claudemax_claude_home() {
+    ensure_isolated_home_safe || return 1
+    mkdir -p "$CLAUDEMAX_CLAUDE_HOME"
+
+    # Keep claudemax auth state isolated from normal claude.ai OAuth state.
+    # Linking ~/.claude leaks claude.ai token material into this profile and
+    # triggers "Auth conflict: Both a token (claude.ai) and an API key".
+    if [[ -L "${CLAUDEMAX_CLAUDE_HOME}/.claude" ]]; then
+        rm -f "${CLAUDEMAX_CLAUDE_HOME}/.claude"
+    fi
+    mkdir -p "${CLAUDEMAX_CLAUDE_HOME}/.claude"
+
+    # Aggressively purge any OAuth credential files that may have leaked
+    # into the isolated profile from prior runs or stale symlinks.
+    rm -f "${CLAUDEMAX_CLAUDE_HOME}/.claude/.credentials.json" 2>/dev/null
+    rm -f "${CLAUDEMAX_CLAUDE_HOME}/.claude/auth.json" 2>/dev/null
+    rm -f "${CLAUDEMAX_CLAUDE_HOME}/.claude/credentials" 2>/dev/null
+
+    # Sync settings.json from real profile so Claude Code picks up
+    # env overrides (MAX_OUTPUT_TOKENS, etc.) and MCP/hook config.
+    if [[ -f "${CLAUDEMAX_SHARED_CLAUDE_DIR}/settings.json" ]]; then
+        cp -f "${CLAUDEMAX_SHARED_CLAUDE_DIR}/settings.json" \
+              "${CLAUDEMAX_CLAUDE_HOME}/.claude/settings.json"
+    fi
+
+    # Symlink hooks + plugins from real profile so settings.json hook
+    # paths (~/.claude/hooks/*) resolve correctly under the isolated HOME.
+    for subdir in hooks plugins; do
+        if [[ -d "${CLAUDEMAX_SHARED_CLAUDE_DIR}/${subdir}" ]]; then
+            local dest="${CLAUDEMAX_CLAUDE_HOME}/.claude/${subdir}"
+            if [[ -L "$dest" ]]; then
+                local current
+                current="$(readlink "$dest" 2>/dev/null || true)"
+                [[ "$current" == "${CLAUDEMAX_SHARED_CLAUDE_DIR}/${subdir}" ]] && continue
+            fi
+            rm -rf "$dest" 2>/dev/null || true
+            ln -s "${CLAUDEMAX_SHARED_CLAUDE_DIR}/${subdir}" "$dest"
+        fi
+    done
+
+    link_shared_entry ".ssh"
+    link_shared_entry ".gitconfig"
+    link_shared_entry ".gitignore"
+    link_shared_entry ".config"
+    link_shared_entry ".codex"
+    link_shared_entry ".npmrc"
+    python3 - "$CLAUDEMAX_SOURCE_STATE_FILE" "$CLAUDE_STATE_FILE" "$ANTHROPIC_API_KEY" <<'PYCODE'
+import json, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+api_key = sys.argv[3]
+data = {}
+if source.exists():
+    try:
+        data = json.loads(source.read_text())
+    except Exception:
+        data = {}
+data.pop('oauthAccount', None)
+responses = data.get('customApiKeyResponses') or {}
+approved = [value for value in (responses.get('approved') or []) if value]
+rejected = [value for value in (responses.get('rejected') or []) if value and value != api_key]
+if api_key not in approved:
+    approved.append(api_key)
+data['customApiKeyResponses'] = {
+    'approved': approved,
+    'rejected': rejected,
+}
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PYCODE
+}
+
+activate_claudemax_claude_home() {
+    export HOME="$CLAUDEMAX_CLAUDE_HOME"
+}
+
+should_bypass_probe() {
+    case "${1:-}" in
+        -h|--help|-v|--version|install|update|upgrade|mcp|plugin|agents)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+launchctl_domain() {
+    printf 'gui/%s' "$(id -u)"
+}
+
+launchctl_service_target() {
+    printf '%s/%s' "$(launchctl_domain)" "$CLAUDEMAX_LAUNCH_LABEL"
+}
+
+launch_agent_loaded() {
+    launchctl print "$(launchctl_service_target)" >/dev/null 2>&1
+}
+
+orchestrator_health_once() {
+    curl -sf -m 5 "$HEALTH_ENDPOINT" >/dev/null 2>&1
+}
+
+wait_for_orchestrator() {
+    local attempts="${1:-8}"
+    local sleep_s="${2:-1}"
+    local i
+    for ((i=1; i<=attempts; i++)); do
+        if orchestrator_health_once; then
+            return 0
+        fi
+        sleep "$sleep_s"
+    done
+    return 1
+}
+
+recover_orchestrator() {
+    route_explain "health_status=down attempting_recovery=1"
+
+    if ! is_local_orchestrator_target >/dev/null 2>&1; then
+        route_explain "recovery_skipped=non_local_base_url base_url=${ANTHROPIC_BASE_URL}"
+        return 1
+    fi
+
+    if [[ "$CLAUDEMAX_RECOVER_ORCHESTRATOR" != "1" ]]; then
+        route_explain "recovery_disabled=1"
+        return 1
+    fi
+
+    if [[ ! -f "$CLAUDEMAX_LAUNCH_PLIST" ]]; then
+        route_explain "launchctl_state=missing_plist plist=${CLAUDEMAX_LAUNCH_PLIST}"
+        return 1
+    fi
+
+    local domain service
+    domain="$(launchctl_domain)"
+    service="$(launchctl_service_target)"
+
+    if launch_agent_loaded; then
+        route_explain "launchctl_state=loaded"
+    else
+        route_explain "launchctl_state=absent action=bootstrap"
+        launchctl bootstrap "$domain" "$CLAUDEMAX_LAUNCH_PLIST" >/dev/null 2>&1 || \
+            launchctl load "$CLAUDEMAX_LAUNCH_PLIST" >/dev/null 2>&1 || true
+    fi
+
+    if wait_for_orchestrator 6 1; then
+        route_explain "health_status=up recovery_result=bootstrap"
+        return 0
+    fi
+
+    if launch_agent_loaded; then
+        route_explain "launchctl_state=loaded action=kickstart"
+        launchctl kickstart -k "$service" >/dev/null 2>&1 || true
+    fi
+
+    if wait_for_orchestrator 12 1; then
+        route_explain "health_status=up recovery_result=kickstart"
+        return 0
+    fi
+
+    route_explain "health_status=down recovery_result=failed"
+    return 1
+}
+
+claude_json_field_from() {
+    local path="$1"
+    local expr="$2"
+    python3 - "$path" "$expr" <<'PYCODE'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+expr = sys.argv[2]
+if not path.exists():
+    sys.exit(1)
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    sys.exit(1)
+if expr == 'oauth_present':
+    print('1' if bool(data.get('oauthAccount')) else '0')
+elif expr == 'approved':
+    for value in (data.get('customApiKeyResponses') or {}).get('approved', []) or []:
+        print(value)
+elif expr == 'rejected':
+    for value in (data.get('customApiKeyResponses') or {}).get('rejected', []) or []:
+        print(value)
+PYCODE
+}
+
+claude_json_field() {
+    claude_json_field_from "$CLAUDE_STATE_FILE" "$1"
+}
+
+raw_claude_json_field() {
+    claude_json_field_from "$CLAUDEMAX_SOURCE_STATE_FILE" "$1"
+}
+
+claude_has_oauth_account() {
+    local path="${1:-$CLAUDE_STATE_FILE}"
+    [[ "$(claude_json_field_from "$path" oauth_present 2>/dev/null || echo 0)" == "1" ]]
+}
+
+claude_api_key_status() {
+    local key="$1"
+    local path="${2:-$CLAUDE_STATE_FILE}"
+    local approved rejected
+    approved="$(claude_json_field_from "$path" approved 2>/dev/null || true)"
+    rejected="$(claude_json_field_from "$path" rejected 2>/dev/null || true)"
+    if printf '%s
+' "$approved" | grep -Fxq "$key"; then
+        echo "approved"
+        return 0
+    fi
+    if printf '%s
+' "$rejected" | grep -Fxq "$key"; then
+        echo "rejected"
+        return 0
+    fi
+    echo "unknown"
+}
+
+emit_auth_fix() {
+    cat >&2 <<EOF2
+claudemax is configured for proxy/API mode with an isolated Claude profile.
+Your normal claude/clauded OAuth login can stay active.
+
+claudemax profile:
+  ${CLAUDEMAX_CLAUDE_HOME}
+
+Helpful checks:
+  claudemax doctor
+  claudemax auth-fix
+EOF2
+}
+
+check_auth_conflict() {
+    local raw_oauth=0
+    local isolated_oauth=0
+    if claude_has_oauth_account "$CLAUDEMAX_SOURCE_STATE_FILE"; then
+        raw_oauth=1
+    fi
+    if claude_has_oauth_account "$CLAUDE_STATE_FILE"; then
+        isolated_oauth=1
+    fi
+    route_explain "auth_mode=proxy raw_oauth=${raw_oauth} isolated_oauth=${isolated_oauth} claudemax_home=${CLAUDEMAX_CLAUDE_HOME} api_key_status=$(claude_api_key_status "$ANTHROPIC_API_KEY" "$CLAUDE_STATE_FILE")"
+
+    if [[ "$CLAUDEMAX_FAIL_FAST_ON_AUTH_CONFLICT" == "1" ]] && [[ "$isolated_oauth" == "1" ]]; then
+        log "claudemax isolated profile still contains claude.ai OAuth state."
+        emit_auth_fix
+        return 1
+    fi
+    return 0
+}
+
+json_escape() {
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
+
+read_cached_record() {
+    if [[ -s "$CLAUDEMAX_CACHE_FILE" ]]; then
+        cat "$CLAUDEMAX_CACHE_FILE"
+        return 0
+    fi
+    if [[ -s "$CLAUDEMAX_LEGACY_CACHE_FILE" ]]; then
+        local legacy
+        legacy="$(cat "$CLAUDEMAX_LEGACY_CACHE_FILE")"
+        printf '{"model":"%s","lane":"interactive_premium","band":"premium","ts":0}\n' "$legacy"
+        return 0
+    fi
+    return 1
+}
+
+cache_field() {
+    local field="$1"
+    local raw="${2:-}"
+    if [[ -z "$raw" ]]; then
+        return 0
+    fi
+    printf '%s' "$raw" | python3 -c 'import json,sys; data=json.loads(sys.stdin.read()); print(data.get(sys.argv[1], ""))' "$field" 2>/dev/null || true
+}
+
+remember_model() {
+    local model="$1"
+    local lane="$2"
+    local band="$3"
+    MODEL="$model" LANE="$lane" BAND="$band" python3 - <<'PY' > "$CLAUDEMAX_CACHE_FILE"
+import json, os, time
+print(json.dumps({
+    "model": os.environ.get("MODEL", ""),
+    "lane": os.environ.get("LANE", "interactive_premium"),
+    "band": os.environ.get("BAND", "premium"),
+    "ts": int(time.time()),
+}))
+PY
+    printf '%s\n' "$model" > "$CLAUDEMAX_LEGACY_CACHE_FILE"
+}
+
+body_has_error() {
+    local body="$1"
+    echo "$body" | grep -qE '"error"|"type":"error"|rate_limit|quota_exceeded|usage_limit_reached|auth_unavailable|model_cooldown|access_terminated_error'
+}
+
+lane_from_task_kind() {
+    local task_kind="${1:-}"
+    case "$task_kind" in
+        design_visual|design_system|product_ux)
+            echo "design_premium"
+            ;;
+        review)
+            echo "review_premium"
+            ;;
+        small_transform)
+            echo "worker_budget"
+            ;;
+        *)
+            echo "interactive_premium"
+            ;;
+    esac
+}
+
+lane_band() {
+    case "${1:-interactive_premium}" in
+        design_premium|interactive_premium|review_premium)
+            echo "premium"
+            ;;
+        interactive_fast)
+            echo "fast"
+            ;;
+        worker_standard)
+            echo "standard"
+            ;;
+        worker_budget)
+            echo "budget"
+            ;;
+        *)
+            echo "premium"
+            ;;
+    esac
+}
+
+lane_candidates() {
+    case "$1" in
+        design_premium)
+            printf '%s\n' "gemini-3.1-pro-high" "claude-opus-4-6" "gemini-2.5-pro"
+            ;;
+        review_premium)
+            printf '%s\n' "claude-opus-4-6" "gpt-5.4" "claude-sonnet-4-6"
+            ;;
+        worker_budget)
+            printf '%s\n' "kimi-k2.5" "glm-4.7" "MiniMax-M2.5-highspeed"
+            ;;
+        worker_standard)
+            printf '%s\n' "gemini-2.5-flash" "kimi-for-coding" "gpt-5.1-codex-mini"
+            ;;
+        interactive_fast)
+            printf '%s\n' "claude-sonnet-4-6" "gemini-2.5-pro" "gpt-5.2-codex"
+            ;;
+        *)
+            printf '%s\n' "gpt-5.4" "claude-opus-4-6" "claude-sonnet-4-6" "gemini-2.5-pro"
+            ;;
+    esac
+}
+
+cache_is_usable() {
+    local lane="$1"
+    local band="$2"
+    local raw
+    raw="$(read_cached_record || true)"
+    [[ -n "$raw" ]] || return 1
+
+    local cached_model cached_lane cached_band cached_ts ttl now age_minutes allow_cross_band
+    cached_model="$(cache_field model "$raw")"
+    cached_lane="$(cache_field lane "$raw")"
+    cached_band="$(cache_field band "$raw")"
+    cached_ts="$(cache_field ts "$raw")"
+    ttl="${CLAUDEMAX_STICKY_MODEL_TTL_MINUTES:-180}"
+    now="$(date +%s)"
+    age_minutes=$(( (now - ${cached_ts:-0}) / 60 ))
+    allow_cross_band="${CLAUDEMAX_ALLOW_CHEAP_BOOTSTRAP:-0}"
+
+    [[ -n "$cached_model" ]] || return 1
+    [[ "$age_minutes" -le "$ttl" ]] || return 1
+    [[ "$cached_lane" == "$lane" ]] || return 1
+    if [[ "$allow_cross_band" != "1" && "$cached_band" != "$band" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$cached_model"
+}
+
+probe_once() {
+    local model="$1"
+    local timeout_s="$2"
+    local tmp_body http_code body
+
+    tmp_body=$(mktemp)
+    http_code=$(curl -sS -w "%{http_code}" -o "$tmp_body" -m "$timeout_s" -X POST "$API_ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
+        -d "{\"model\":\"$model\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"test\"}],\"metadata\":{\"claudemax_lane\":\"${CLAUDEMAX_LANE:-interactive_premium}\",\"task_kind\":\"${CLAUDEMAX_TASK_KIND:-general}\"}}" 2>/dev/null || echo "000")
+    body=$(cat "$tmp_body" 2>/dev/null || true)
+    rm -f "$tmp_body"
+
+    route_explain "probe_result model=${model} status=${http_code}"
+    if [[ "$http_code" == "200" ]] && ! body_has_error "$body"; then
+        remember_model "$model" "${CLAUDEMAX_LANE:-interactive_premium}" "$(lane_band "${CLAUDEMAX_LANE:-interactive_premium}")"
+        return 0
+    fi
+    return 1
+}
+
+test_model() {
+    local model="$1"
+    local timeout_s="${2:-8}"
+    local attempt
+
+    for attempt in 1 2; do
+        if probe_once "$model" "$timeout_s"; then
+            return 0
+        fi
+        timeout_s=$((timeout_s + 4))
+        sleep 1
+    done
+    return 1
+}
+
+find_best_model() {
+    local lane="$1"
+    local band="$2"
+    log "Checking available models for lane=$lane band=$band..."
+
+    local candidates=()
+    local cached_model
+    cached_model="$(cache_is_usable "$lane" "$band" || true)"
+    if [[ -n "$cached_model" ]]; then
+        candidates+=("$cached_model")
+        route_explain "sticky-cache hit: model=$cached_model lane=$lane band=$band"
+    fi
+
+    while IFS= read -r model; do
+        [[ -n "$model" ]] && candidates+=("$model")
+    done < <(lane_candidates "$lane")
+
+    if [[ "${CLAUDEMAX_ALLOW_CHEAP_BOOTSTRAP:-0}" == "1" && "$lane" != "worker_budget" ]]; then
+        candidates+=("glm-4.7" "kimi-k2.5")
+    fi
+
+    local seen="|"
+    local model
+    for model in "${candidates[@]}"; do
+        if [[ "$seen" == *"|$model|"* ]]; then
+            continue
+        fi
+        seen+="$model|"
+        route_explain "probe candidate: lane=$lane model=$model"
+        if test_model "$model"; then
+            log "✓ Using bootstrap model: $model"
+            echo "$model"
+            return 0
+        fi
+    done
+
+    local fallback
+    fallback="$(lane_candidates "$lane" | head -n 1)"
+    warn "Probes failed; using optimistic bootstrap model: $fallback"
+    echo "$fallback"
+}
+
+claudemax_doctor() {
+    local health_status="down"
+    local launch_state="not_loaded"
+    local plist_state="missing"
+    local raw_oauth_state="logged_out"
+    local isolated_oauth_state="logged_out"
+    local api_key_status="$(claude_api_key_status "$ANTHROPIC_API_KEY" "$CLAUDE_STATE_FILE")"
+
+    [[ -f "$CLAUDEMAX_LAUNCH_PLIST" ]] && plist_state="installed"
+    launch_agent_loaded && launch_state="loaded"
+    orchestrator_health_once && health_status="up"
+    claude_has_oauth_account "$CLAUDEMAX_SOURCE_STATE_FILE" && raw_oauth_state="logged_in"
+    claude_has_oauth_account "$CLAUDE_STATE_FILE" && isolated_oauth_state="logged_in"
+
+    log "claudemax doctor"
+    log "  base_url: ${ANTHROPIC_BASE_URL}"
+    log "  api_endpoint: ${API_ENDPOINT}"
+    log "  health_endpoint: ${HEALTH_ENDPOINT}"
+    log "  ambient_anthropic_env_ignored: ${CLAUDEMAX_AMBIENT_ENV_IGNORED}"
+    log "  orchestrator_health: ${health_status}"
+    log "  launchagent_plist: ${plist_state} (${CLAUDEMAX_LAUNCH_PLIST})"
+    log "  launchagent_state: ${launch_state}"
+    log "  claudemax_home: ${CLAUDEMAX_CLAUDE_HOME}"
+    log "  shared_claude_dir: ${CLAUDEMAX_SHARED_CLAUDE_DIR}"
+    log "  raw_claude_oauth: ${raw_oauth_state}"
+    log "  claudemax_oauth: ${isolated_oauth_state}"
+    log "  api_key_status: ${api_key_status}"
+
+    local summary="ready"
+    if [[ "$health_status" != "up" ]]; then
+        if is_local_orchestrator_target >/dev/null 2>&1; then
+            summary="needs orchestrator restart"
+        else
+            summary="remote target unreachable"
+        fi
+    fi
+    if [[ "$api_key_status" != "approved" ]]; then
+        summary="needs proxy api-key approval"
+    fi
+    if [[ "$isolated_oauth_state" == "logged_in" ]]; then
+        summary="needs claudemax profile reset"
+    fi
+
+    log "  summary: ${summary}"
+
+    if [[ "$summary" == "needs orchestrator restart" ]] && is_local_orchestrator_target >/dev/null 2>&1; then
+        log "  recovery: launchctl kickstart -k gui/$(id -u)/${CLAUDEMAX_LAUNCH_LABEL}"
+    fi
+    if [[ "$summary" == "needs proxy api-key approval" || "$summary" == "needs claudemax profile reset" ]]; then
+        log "  auth_fix: claudemax auth-fix"
+    fi
+
+    [[ "$summary" == "ready" ]]
+}
+
+claudemax_auth_fix() {
+    log "claudemax auth-fix"
+    emit_auth_fix
+    log "Current status:"
+    log "  raw_claude_oauth=$(if claude_has_oauth_account "$CLAUDEMAX_SOURCE_STATE_FILE"; then echo logged_in; else echo logged_out; fi)"
+    log "  claudemax_oauth=$(if claude_has_oauth_account "$CLAUDE_STATE_FILE"; then echo logged_in; else echo logged_out; fi)"
+    log "  api_key_status=$(claude_api_key_status "$ANTHROPIC_API_KEY" "$CLAUDE_STATE_FILE")"
+}
+
+require_command python3 "Install Python 3; claudemax uses it for profile isolation and JSON state handling." || exit 1
+require_command curl "Install curl; claudemax uses it for orchestrator health checks and model probes." || exit 1
+require_command claude "Install Claude Code; claudemax launches the Claude CLI after proxy preflight." || exit 1
+
+if ! validate_base_url; then
+    log "Invalid CLAUDEMAX_BASE_URL/ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}"
+    log "Expected an http(s) URL such as http://127.0.0.1:8318"
+    exit 1
+fi
+
+if ! prepare_claudemax_claude_home; then
+    log "Failed to prepare isolated claudemax profile at ${CLAUDEMAX_CLAUDE_HOME}."
+    exit 1
+fi
+activate_claudemax_claude_home
+
+if [[ "${1:-}" == "doctor" ]]; then
+    shift
+    claudemax_doctor "$@"
+    exit $?
+fi
+
+if [[ "${1:-}" == "auth-fix" ]]; then
+    shift
+    claudemax_auth_fix "$@"
+    exit 0
+fi
+
+if [[ "${1:-}" == "auth" || "${1:-}" == "setup-token" ]]; then
+    log "claudemax uses the fullstackOS proxy profile, not Claude OAuth login commands."
+    log "Use raw 'claude auth' or 'claude setup-token' for your normal OAuth/subscription session."
+    log "Use 'claudemax doctor' to verify the isolated proxy profile."
+    exit 2
+fi
+
+if should_bypass_probe "${1:-}"; then
+    export ANTHROPIC_BASE_URL
+    export ANTHROPIC_API_KEY
+    exec claude "$@"
+fi
+
+if [[ -z "${CLAUDEMAX_LANE:-}" ]]; then
+    CLAUDEMAX_LANE="$(lane_from_task_kind "${CLAUDEMAX_TASK_KIND:-general}")"
+fi
+export CLAUDEMAX_LANE
+
+log "Finding best available model..."
+route_explain "lane=${CLAUDEMAX_LANE} task_kind=${CLAUDEMAX_TASK_KIND:-general}"
+route_explain "base_url=${ANTHROPIC_BASE_URL} api_endpoint=${API_ENDPOINT} health_endpoint=${HEALTH_ENDPOINT}"
+route_explain "ambient_anthropic_env_present=${AMBIENT_ANTHROPIC_ENV_PRESENT} ambient_anthropic_env_ignored=${CLAUDEMAX_AMBIENT_ENV_IGNORED}"
+route_explain "claudemax_home=${CLAUDEMAX_CLAUDE_HOME} raw_claude_home=${CLAUDEMAX_REAL_HOME}"
+
+if ! check_auth_conflict; then
+    exit 1
+fi
+
+if ! wait_for_orchestrator 4 2; then
+    warn "Orchestrator is unavailable on ${ANTHROPIC_BASE_URL}. Attempting recovery..."
+    if ! recover_orchestrator; then
+        if is_local_orchestrator_target >/dev/null 2>&1; then
+            log "Orchestrator on ${ANTHROPIC_BASE_URL} is unavailable after auto-recovery attempts."
+            print_log_tail "$CLAUDEMAX_STDOUT_LOG" "orchestrator stdout" 20
+            print_log_tail "$CLAUDEMAX_STDERR_LOG" "orchestrator stderr" 40
+        else
+            log "Orchestrator target ${ANTHROPIC_BASE_URL} is unreachable, and auto-recovery only applies to local :8318."
+        fi
+        exit 1
+    fi
+fi
+
+REQUESTED_MODEL="${ANTHROPIC_MODEL:-}"
+if [[ -n "$REQUESTED_MODEL" ]]; then
+    log "Requested: $REQUESTED_MODEL"
+    if test_model "$REQUESTED_MODEL" 10; then
+        export ANTHROPIC_MODEL="$REQUESTED_MODEL"
+        log "✓ Available: $REQUESTED_MODEL"
+    else
+        warn "$REQUESTED_MODEL unavailable"
+        export ANTHROPIC_MODEL="$(find_best_model "$CLAUDEMAX_LANE" "$(lane_band "$CLAUDEMAX_LANE")")"
+    fi
+else
+    export ANTHROPIC_MODEL="$(find_best_model "$CLAUDEMAX_LANE" "$(lane_band "$CLAUDEMAX_LANE")")"
+fi
+
+export ANTHROPIC_BASE_URL
+export ANTHROPIC_API_KEY
+
+route_explain "selected_model=${ANTHROPIC_MODEL} health_status=up launchctl_state=$(if launch_agent_loaded; then echo loaded; else echo absent; fi)"
+
+log ""
+log "Starting Claude with: $ANTHROPIC_MODEL"
+log ""
+
+MCP_ARGS=()
+if [[ -n "${CLAUDE_MCP_CONFIG:-}" ]]; then
+    MCP_ARGS=(--mcp-config "$CLAUDE_MCP_CONFIG")
+    unset CLAUDE_MCP_CONFIG
+fi
+
+if (( ${#MCP_ARGS[@]} > 0 )); then
+    exec claude --dangerously-skip-permissions "${MCP_ARGS[@]}" "$@"
+else
+    exec claude --dangerously-skip-permissions "$@"
+fi

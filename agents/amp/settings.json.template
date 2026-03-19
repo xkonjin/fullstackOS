@@ -1,0 +1,43 @@
+{
+  "model": "opus",
+  "amp.dangerouslyAllowAll": true,
+  "amp.mcpServers": {
+    "figma": {
+      "url": "http://127.0.0.1:3845/mcp"
+    },
+    "example-integration": {
+      "url": "https://mcp.composio.dev/partner/composio/rube/mcp?customerId=8bb17cdb-4c5c-4fef-9f2a-991105a56165",
+      "headers": {
+        "x-api-key": "${INTEGRATION_API_KEY}"
+      }
+    },
+    "sentry": {
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    "posthog": {
+      "url": "https://mcp.posthog.com/mcp"
+    }
+  },
+  "amp.permissions": [
+    {
+      "tool": "mcp__example-integration__CHECK_ACTIVE_CONNECTION",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__example-integration__GET_REQUIRED_PARAMETERS",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__example-integration__SEARCH_TOOLS",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__example-integration__INITIATE_CONNECTION",
+      "action": "ask"
+    },
+    {
+      "tool": "mcp__example-integration__EXECUTE_TOOL",
+      "action": "ask"
+    }
+  ]
+}

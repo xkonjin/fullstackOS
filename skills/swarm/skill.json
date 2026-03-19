@@ -1,0 +1,20 @@
+{
+  "name": "swarm",
+  "version": "2.0.0",
+  "description": "Unified autonomous multi-repo engineering: Codex + Claude agents, RALPH self-correction, CI monitor, sequential merge, live testing across selected repos",
+  "author": "fullstackOS contributors",
+  "keywords": [
+    "swarm",
+    "/swarm",
+    "lfg-multi",
+    "/lfg-multi",
+    "autonomous swarm",
+    "multi-repo swarm",
+    "parallel repos",
+    "repo sweep",
+    "multi-repo",
+    "multi-repo-lfg"
+  ],
+  "requirements": [],
+  "instructions": "Use when user says /swarm or /lfg-multi or asks to run autonomous engineering across multiple repos. Supersedes multi-repo-lfg. Handles Codex/Claude routing, RALPH loops, CI monitoring, sequential merge, and live testing."
+}

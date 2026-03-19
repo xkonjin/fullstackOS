@@ -1,0 +1,59 @@
+name: runtime-validation
+
+on:
+  pull_request:
+    paths:
+      - "services/orchestrator/**"
+      - "coordinator/**"
+      - "fleet/**"
+      - "tests/**"
+      - "install.sh"
+      - "Makefile"
+      - ".github/workflows/runtime-validation.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/orchestrator/**"
+      - "coordinator/**"
+      - "fleet/**"
+      - "tests/**"
+      - "install.sh"
+      - "Makefile"
+  workflow_dispatch: {}
+
+jobs:
+  orchestrator-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/orchestrator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install orchestrator deps
+        run: bun install --frozen-lockfile || bun install
+      - name: Run orchestrator tests
+        run: bun test
+
+  python-runtime-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Run targeted runtime and security tests
+        run: |
+          python -m pytest \
+            tests/test_task_api.py \
+            tests/test_doctor_json.py \
+            tests/test_budget.py \
+            tests/test_emergency_failover.py \
+            tests/test_health_parallel.py \
+            tests/test_wave19_compression_audit.py \
+            tests/test_wave20_keepalive_structured_log.py \
+            -q

@@ -1,0 +1,170 @@
+{
+  "env": {
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000"
+  },
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__posthog__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/posthog-readonly.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__figma__get_design_context|mcp__figma__get_metadata",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/figma-mcp-guard.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/bash-security-check.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/protect-files.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__example-integration__|mcp__example-integration__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/rube-blocker.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__claude_ai_Crypto_com__|mcp__claude_ai_AWS_Marketplace__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Crypto.com and AWS Marketplace MCP tools are disabled by user policy' >&2; exit 2",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$FILE\" ] && command -v npx >/dev/null && [ -f \"$FILE\" ]; then npx prettier --write \"$FILE\" 2>/dev/null || true; fi",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '\"[\" + (now | strftime(\"%Y-%m-%d %H:%M:%S\")) + \"] \" + .tool_input.command' >> ~/.claude/command-log.txt",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"Claude Code needs your attention\" with title \"Claude Code\"'",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/continuity/pre-compact.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/context-budget-governor.sh 2>/dev/null || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/scoped-session-start.sh 2>/dev/null || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/figma-mcp-health.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'LATEST=$(ls -d ~/.claude/plugins/cache/claude-reflect-marketplace/claude-reflect/* 2>/dev/null | sort -V | tail -1); [ -n \"$LATEST\" ] && python3 \"$LATEST/scripts/check_learnings.py\" || true'",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "~/.local/bin/ai-coordinator-maintain-hook 2>&1 || true",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "figma": {
+      "url": "https://mcp.figma.com/mcp"
+    },
+    "sentry": {
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    "posthog": {
+      "url": "https://mcp.posthog.com/mcp"
+    }
+  },
+  "enabledPlugins": {
+    "claude-mem@thedotmack": true,
+    "claude-reflect@claude-reflect-marketplace": true
+  }
+}

@@ -1,0 +1,51 @@
+version: 1
+
+servers:
+  figma:
+    type: url
+    url: https://mcp.figma.com/mcp
+    profiles: [ui-design, lean-default]
+  context7:
+    type: command
+    command: npx
+    args: [-y, "@upstash/context7-mcp@latest"]
+    profiles: [core-research, ui-design, lean-default]
+  exa:
+    type: url
+    url: https://mcp.exa.ai/mcp?exaApiKey=${EXA_API_KEY}&tools=web_search_exa,get_code_context_exa,company_research_exa
+    env:
+      EXA_API_KEY: ${EXA_API_KEY}
+    profiles: [core-research]
+  playwright:
+    type: command
+    command: npx
+    args: [-y, "@playwright/mcp@latest"]
+    profiles: [ui-design, browser-debug]
+  chrome-devtools:
+    type: command
+    command: npx
+    args: [-y, chrome-devtools-mcp@latest]
+    profiles: [browser-debug]
+  gitnexus:
+    type: command
+    command: gitnexus
+    args: [mcp]
+    profiles: [core-research, lean-default]
+
+profiles:
+  lean-default:
+    servers: [figma, context7, gitnexus]
+  core-research:
+    servers: [context7, exa, gitnexus]
+  ui-design:
+    servers: [figma, playwright, context7]
+  browser-debug:
+    servers: [playwright, chrome-devtools]
+  backend-impl:
+    servers: [gitnexus, context7, exa]
+  security-audit:
+    servers: [gitnexus, exa]
+  deploy-verify:
+    servers: [gitnexus]
+  full-research:
+    servers: [context7, exa, gitnexus]
