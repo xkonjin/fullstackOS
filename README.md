@@ -1,5 +1,7 @@
 # fullstackOS
 
+This is all WIP, buggy and my current prod stack.
+
 Infrastructure for running AI coding agents (Claude Code, Codex, Amp, Droid) continuously at scale — smart routing, multi-provider failover, skill-aware dispatch, and a self-correcting fleet pipeline.
 
 ## The Problem
